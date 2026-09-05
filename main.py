@@ -222,7 +222,7 @@ def rich_buttons(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup
 # Native button colors (Bot API 9.4, Feb 9 2026)
 # --------------------------------------------------------------------------- #
 # InlineKeyboardButton got a real `style` field: 'primary' (blue),
-# 'success' (green), 'danger' (red). That's the FULL set Telegram supports —
+# 'success' (green) and 'danger' (red). That's the FULL set Telegram supports —
 # there is no 'warning'/'ghost'/etc. Any style outside VALID_STYLES is simply
 # omitted, so the client renders its normal default-colored button instead of
 # erroring out. Requires python-telegram-bot >= 22.7.
@@ -913,13 +913,13 @@ def is_group(update: Update) -> bool:
     return bool(chat) and chat.type in ("group", "supergroup")
 
 
-async def do_search(update: Update, query: str) -> None:
+async def do_search(update: Update, query: str, raw_output: bool = False) -> None:
     message = update.effective_message
     user_id = update.effective_user.id if update.effective_user else 0
     query = (query or "").strip()
 
-    if len(query) < 2:
-        await message.reply_html("🔎 Send at least two characters to look up.")
+    if len(query) < 10:
+        await message.reply_html("🔎 Please provide at least 10 characters.")
         return
     if len(query) > 200:
         query = query[:200]
@@ -961,21 +961,59 @@ async def do_search(update: Update, query: str) -> None:
     remember(user_id, query)
 
     if not result.items:
-        await placeholder.edit_text(
-            f"🫥 <b>No records</b> for <code>{esc(shorten(query, 60))}</code>.\n"
-            "<i>Try a different spelling, a username, or a full email address.</i>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=rich_buttons([[btn("🔁 Try again", "menu|0|0", "primary")]]),
-        )
+        if raw_output:
+            # No data found: simple text without buttons
+            await placeholder.edit_text("No data found.", parse_mode=ParseMode.HTML)
+        else:
+            await placeholder.edit_text(
+                f"🫥 <b>No records</b> for <code>{esc(shorten(query, 60))}</code>.\n"
+                "<i>Try a different spelling, a username, or a full email address.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=rich_buttons([[btn("🔁 Try again", "menu|0|0", "primary")]]),
+            )
         return
 
     STATS["hits"] += 1
     if not typing.done():
         typing.cancel()
 
-    # Groups get the exact same styled card UI as private chats now — no more
-    # raw JSON dumps. The only difference is a "Requested by" line so it's
-    # clear who ran the search in a shared chat.
+    if raw_output:
+        # Build summary line: "🛰 LOOKUP COMPLETE 🎯 Target {query} 📦 Records · {len} 📑 Page · 1/1 ⚡️ {elapsed} ms 🙋 Requested by {name}"
+        summary_parts = [
+            "🛰 LOOKUP COMPLETE",
+            f"🎯 Target <code>{esc(shorten(result.query, 64))}</code>",
+            f"📦 Records · <code>{len(result.items)}</code>",
+            "📑 Page · <code>1/1</code>",
+            f"⚡️ <code>{result.elapsed_ms} ms</code>",
+        ]
+        # Add "Requested by" if applicable
+        requester = None
+        # We need to add it only if group and we have the user
+        # But the key is not available here because we don't cache for raw_output? Actually we don't cache for raw_output? We can either not cache or still cache but we don't have a key yet.
+        # For raw_output, we don't need the cache key; we can directly add the user's name if group.
+        if group and update.effective_user:
+            requester = update.effective_user.full_name or (
+                f"@{update.effective_user.username}" if update.effective_user.username else "Someone"
+            )
+        if requester:
+            summary_parts.append(f"🙋 Requested by <b>{esc(requester)}</b>")
+        summary = "\n".join(summary_parts)
+
+        # Full JSON from result.raw
+        json_pretty = json.dumps(result.raw, indent=2, ensure_ascii=False, default=str)
+        # Truncate if too long? We'll let Telegram truncate if it's too long, but we can keep it under MAX_MESSAGE.
+        if len(summary) + len(json_pretty) + 100 > MAX_MESSAGE:
+            json_pretty = json_pretty[:MAX_MESSAGE - len(summary) - 100] + "…"
+        full_text = f"{summary}\n\n{block_code(json_pretty)}"
+        await placeholder.edit_text(
+            full_text,
+            parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            # No reply_markup
+        )
+        return
+
+    # Normal (non-raw) flow: use cached key and render interactive cards
     key = cache_put(result)
     if group and update.effective_user:
         REQUESTED_BY[key] = update.effective_user.full_name or (
@@ -991,7 +1029,7 @@ async def do_search(update: Update, query: str) -> None:
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await do_search(update, " ".join(context.args or []))
+    await do_search(update, " ".join(context.args or []), raw_output=False)
 
 
 async def cmd_num(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1003,7 +1041,7 @@ async def cmd_num(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     always reaches the bot in any group, so it's the one thing guaranteed
     to work there.
     """
-    await do_search(update, " ".join(context.args or []))
+    await do_search(update, " ".join(context.args or []), raw_output=True)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1012,7 +1050,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # No plain-text, @mention, or reply auto-search, to keep the bot
         # quiet unless explicitly asked via the command.
         return
-    await do_search(update, update.effective_message.text or "")
+    await do_search(update, update.effective_message.text or "", raw_output=False)
 
 
 # ---- callbacks ------------------------------------------------------------ #
@@ -1063,7 +1101,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         stored = RUNTIME.get("history_map", {}).get(key)
         await query.answer("Re-running…" if stored else "That query expired.")
         if stored:
-            await do_search(update, stored)
+            await do_search(update, stored, raw_output=False)  # history recall from menu should use normal UI
         return
 
     result = CACHE.get(key)
