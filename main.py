@@ -91,7 +91,7 @@ ADMIN_IDS = {
     int(x) for x in re.split(r"[,\s]+", os.environ.get("ADMIN_IDS", "6846112069, 7910994767")) if x.strip().isdigit()
 }
 
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://numinfo-bot-w2qp.onrender.com").strip().rstrip("/")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://numinfo-bot-2he4.onrender.com").strip().rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "") or secrets.token_urlsafe(24)
 
