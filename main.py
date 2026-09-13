@@ -76,10 +76,10 @@ from telegram.ext import (
 # Configuration                                                                #
 # --------------------------------------------------------------------------- #
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8748100209:AAECZA5WYFZ-xId0XgIFl4Ct4dyza8pWOH8").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8748100209:AAGZptgEMNrkMT5ZZ89VQYQfHHKd0zk3mto").strip()
 BOT_NAME = os.environ.get("BOT_NAME", "OSINT Lookup")
 
-SEARCH_API_URL = os.environ.get("SEARCH_API_URL", "https://icmr-and-hitek-95hp.onrender.com/search?q={q}").strip()
+SEARCH_API_URL = os.environ.get("SEARCH_API_URL", "https://icmr-and-hitek-7fdc.vercel.app/search?q={q}").strip()
 API_HEADERS_RAW = os.environ.get("API_HEADERS", "").strip()
 
 PAGE_SIZE = max(1, min(10, int(os.environ.get("PAGE_SIZE", "4"))))
