@@ -8,7 +8,8 @@ Access model
 * Groups         : the bot works ONLY in groups on the allowlist. Everywhere
                    else it is completely silent.
 * Adding the bot : added by an admin  -> group is authorized automatically
-                   added by anyone else -> bot leaves and alerts the admins.
+                   added by anyone else -> bot stays SILENT in 'pending' state, admins get
+                   [Approve] / [Reject] buttons. No decision in PENDING_TTL_HOURS -> it leaves.
 * Buttons        : in groups, result buttons only work for the person who ran
                    the search (and for admins).
 * The data source URL is never shown to end users.
@@ -35,6 +36,7 @@ GROUP_MEMBERS_CAN_SEARCH  1 = any member of an allowed group may use /num,
 AUTO_APPROVE_ADMIN_ADDS   1 = group auto-allowed when an admin adds the bot
 SILENT_DENY      1 = non-admins in DMs get no reply at all (default 0)
 GROUP_RAW        1 = /num in groups answers with raw JSON (default 0 = cards)
+PENDING_TTL_HOURS  hours an unapproved group may keep the bot before it leaves (default 24)
 PAGE_SIZE, REQUEST_TIMEOUT, COOLDOWN_SECONDS, DAILY_LIMIT, MIN_QUERY,
 QUERY_CACHE_TTL, BOT_NAME
 
@@ -124,6 +126,7 @@ SILENT_DENY = _env_bool("SILENT_DENY")
 AUTO_APPROVE_ADMIN_ADDS = _env_bool("AUTO_APPROVE_ADMIN_ADDS", "1")
 MEMBERS_CAN_SEARCH = _env_bool("GROUP_MEMBERS_CAN_SEARCH", "1")
 GROUP_RAW = _env_bool("GROUP_RAW")
+PENDING_TTL = float(os.environ.get("PENDING_TTL_HOURS", "24")) * 3600
 
 CACHE_TTL = 3600
 MAX_MESSAGE = 3900
@@ -189,6 +192,7 @@ STATS: dict[str, Any] = {
 }
 
 ALLOWED_GROUPS: dict[int, dict[str, Any]] = {}
+PENDING: dict[int, dict[str, Any]] = {}  # groups waiting for admin approval
 _DENY_NOTICE: dict[int, float] = {}
 
 
@@ -267,6 +271,7 @@ def save_groups() -> None:
 
 def authorize_group(chat_id: int, title: str | None, by: int) -> None:
     ALLOWED_GROUPS[chat_id] = {"title": title or str(chat_id), "by": by, "ts": int(time.time())}
+    PENDING.pop(chat_id, None)
     save_groups()
 
 
@@ -277,11 +282,11 @@ def revoke_group(chat_id: int) -> bool:
     return removed
 
 
-async def notify_admins(bot, text: str) -> None:
+async def notify_admins(bot, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
-                admin_id, text, parse_mode=ParseMode.HTML,
+                admin_id, text, parse_mode=ParseMode.HTML, reply_markup=markup,
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
         except TelegramError:
@@ -354,7 +359,7 @@ async def access_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # Rich block primitives                                                        #
 # --------------------------------------------------------------------------- #
 
-DIV = "━━━━━━━━━━━━━━━━━━"
+DIV = "━━━━━━━━━━━━━━━━━━━━"
 
 
 def esc(value: Any) -> str:
@@ -370,12 +375,52 @@ def block_code(payload: str, language: str = "json") -> str:
 
 
 def block_table(pairs: list[tuple[str, str]]) -> str:
-    """Compact key/value tree."""
+    """Plain key/value tree (admin panels)."""
     if not pairs:
         return ""
     last = len(pairs) - 1
     return "\n".join(
-        f"{'└' if i == last else '├'} <b>{esc(k)}</b> · {esc(v)}" for i, (k, v) in enumerate(pairs)
+        f"{'┗' if i == last else '┣'} <b>{esc(k)}</b> ▸ {esc(v)}" for i, (k, v) in enumerate(pairs)
+    )
+
+
+ICON_RULES: list[tuple[frozenset, str]] = [
+    (frozenset({"name", "fullname", "father", "mother", "owner", "user", "username", "handle", "surname", "first", "last"}), "👤"),
+    (frozenset({"phone", "mobile", "number", "msisdn", "contact", "alt", "alternate", "tel", "whatsapp"}), "📞"),
+    (frozenset({"email", "mail"}), "📧"),
+    (frozenset({"address", "addr", "street", "house", "locality", "landmark"}), "🏠"),
+    (frozenset({"city", "district", "state", "country", "region", "location", "circle", "pincode", "pin", "zip", "postal", "area"}), "📍"),
+    (frozenset({"ip", "domain", "host", "url", "link", "website", "site", "dns"}), "🌐"),
+    (frozenset({"date", "time", "created", "updated", "dob", "birth", "age", "year", "since"}), "📅"),
+    (frozenset({"id", "uid", "uuid", "aadhaar", "aadhar", "pan", "ref", "reference"}), "🆔"),
+    (frozenset({"operator", "carrier", "provider", "network", "sim", "isp", "telecom"}), "📡"),
+    (frozenset({"company", "org", "organization", "employer", "job", "work", "business"}), "🏢"),
+    (frozenset({"password", "passwd", "pass", "hash", "token", "secret", "otp", "cvv"}), "🔐"),
+    (frozenset({"status", "active", "verified", "valid", "type", "category"}), "✅"),
+    (frozenset({"score", "count", "total", "rank", "rating"}), "📊"),
+    (frozenset({"gender", "sex"}), "🧬"),
+    (frozenset({"source", "database", "breach", "leak"}), "🗄"),
+]
+
+
+def key_icon(label: str) -> str:
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", label)
+    tokens = [t for t in re.split(r"[^a-z0-9]+", spaced.lower()) if t]
+    for tok in reversed(tokens):
+        for keys, icon in ICON_RULES:
+            if tok in keys:
+                return icon
+    return "▫️"
+
+
+def fields_block(pairs: list[tuple[str, str]]) -> str:
+    """Icon + label + tap-to-copy value, drawn as a tree."""
+    if not pairs:
+        return ""
+    last = len(pairs) - 1
+    return "\n".join(
+        f"{'┗' if i == last else '┣'} {key_icon(k)} <b>{esc(k)}</b> ▸ <code>{esc(v)}</code>"
+        for i, (k, v) in enumerate(pairs)
     )
 
 
@@ -468,6 +513,17 @@ def mask_if_sensitive(key: str, value: str) -> str:
     if tokens & SENSITIVE_TOKENS and len(value) > 4:
         return value[:2] + "•" * min(10, len(value) - 4) + value[-2:]
     return value
+
+
+def masked_copy(obj: Any, key: str = "") -> Any:
+    """Deep copy with sensitive-looking string values masked (display only)."""
+    if isinstance(obj, dict):
+        return {k: masked_copy(v, str(k)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [masked_copy(v, key) for v in obj]
+    if isinstance(obj, str):
+        return mask_if_sensitive(key, obj)
+    return obj
 
 
 def format_scalar(value: Any) -> str:
@@ -579,6 +635,10 @@ def display_name(user) -> str:
 # --------------------------------------------------------------------------- #
 
 
+CARD_SEP = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+FOOTER = "🔐 <i>Sensitive fields are masked · tap any value to copy</i>"
+
+
 def render_card(item: Any, index: int, max_pairs: int, body_limit: int = 150) -> str:
     marker = MARKERS[index % len(MARKERS)]
     lines = [f"{marker} <b>{esc(item_title(item, index))}</b>"]
@@ -594,7 +654,7 @@ def render_card(item: Any, index: int, max_pairs: int, body_limit: int = 150) ->
     if body_key and isinstance(body, str):
         used.add(body_key)
         if body_limit:
-            lines.append(f"<i>{esc(shorten(strip_tags(body), body_limit))}</i>")
+            lines.append(f"💬 <i>{esc(shorten(strip_tags(body), body_limit))}</i>")
 
     if max_pairs:
         pairs: list[tuple[str, str]] = []
@@ -602,10 +662,22 @@ def render_card(item: Any, index: int, max_pairs: int, body_limit: int = 150) ->
             if len(pairs) >= max_pairs:
                 break
             pairs.append((key, mask_if_sensitive(key, format_scalar(value))))
-        table = block_table(pairs)
+        table = fields_block(pairs)
         if table:
             lines.append(table)
     return "\n".join(lines)
+
+
+def export_payload(result: SearchResult, index: int | None = None) -> dict[str, Any]:
+    meta = {
+        "query": result.query,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "total_records": len(result.items),
+        "latency_ms": result.elapsed_ms,
+    }
+    if index is None:
+        return {"meta": meta, "results": result.items}
+    return {"meta": {**meta, "record_index": index + 1}, "record": result.items[index]}
 
 
 def render_results(key: str, result: SearchResult, page: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -618,52 +690,60 @@ def render_results(key: str, result: SearchResult, page: int) -> tuple[str, Inli
     chunk = result.items[start : start + PAGE_SIZE]
 
     head = [
-        "🛰 <b>LOOKUP COMPLETE</b>",
+        "🛰 <b>LOOKUP COMPLETE</b> ✅",
         DIV,
-        f"🎯 <b>Target</b> · <code>{esc(shorten(result.query, 64))}</code>",
-        f"📦 <b>Records</b> · <code>{total}</code>   "
-        f"📑 <b>Page</b> · <code>{page + 1}/{pages}</code>   "
-        f"⚡ <code>{result.elapsed_ms} ms</code>",
+        f"🎯 <b>Target</b> ▸ <code>{esc(shorten(result.query, 64))}</code>",
+        f"📦 <b>Records</b> ▸ <code>{total}</code>   📄 <b>Page</b> ▸ <code>{page + 1}/{pages}</code>",
+        f"⚡ <b>Speed</b> ▸ <code>{result.elapsed_ms} ms</code>   "
+        f"🕒 <code>{time.strftime('%H:%M', time.gmtime())} UTC</code>",
     ]
     if meta.get("by"):
-        head.append(f"🙋 <b>Requested by</b> · {esc(meta['by'])}")
+        head.append(f"🙋 <b>Requested by</b> ▸ {esc(meta['by'])}")
     extra = [
         f"{humanize_key(k)}: {format_scalar(v)}"
         for k, v in list(result.meta.items())[:3]
         if str(k).lower() not in {"query", "q"}
     ]
     if extra:
-        head.append(f"<i>{esc(' · '.join(extra))}</i>")
+        head.append(f"ℹ️ <i>{esc(' · '.join(extra))}</i>")
     header = "\n".join(head) + "\n" + DIV + "\n\n"
+    footer = "\n\n" + DIV + "\n" + FOOTER
 
     text = header
-    for budget in (4, 3, 2, 1, 0):
-        body = "\n\n".join(render_card(it, start + i, budget) for i, it in enumerate(chunk))
-        text = header + (body or "<i>Empty page.</i>")
+    for budget in (5, 4, 3, 2, 1, 0):
+        body = f"\n\n{CARD_SEP}\n\n".join(
+            render_card(it, start + i, budget) for i, it in enumerate(chunk)
+        )
+        text = header + (body or "<i>Empty page.</i>") + footer
         if len(text) <= MAX_MESSAGE:
             break
 
     rows: list[list[InlineKeyboardButton]] = []
-    opens = [btn(MARKERS[(start + i) % len(MARKERS)], f"d|{key}|{start + i}") for i in range(len(chunk))]
-    if opens:
-        rows.append(opens)
+    opens = [
+        btn(
+            f"{MARKERS[(start + i) % len(MARKERS)]} {shorten(item_title(it, start + i), 14)}",
+            f"d|{key}|{start + i}",
+            "primary",
+        )
+        for i, it in enumerate(chunk)
+    ]
+    for i in range(0, len(opens), 2):
+        rows.append(opens[i : i + 2])
 
-    nav: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav += [btn("⏮", f"p|{key}|0"), btn("◀️", f"p|{key}|{page - 1}", "primary")]
-    nav.append(btn(f"· {page + 1}/{pages} ·", "noop"))
-    if page < pages - 1:
-        nav += [btn("▶️", f"p|{key}|{page + 1}", "primary"), btn("⏭", f"p|{key}|{pages - 1}")]
-    rows.append(nav)
+    if pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav += [btn("⏮", f"p|{key}|0"), btn("◀️", f"p|{key}|{page - 1}", "primary")]
+        nav.append(btn(f"📄 {page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav += [btn("▶️", f"p|{key}|{page + 1}", "primary"), btn("⏭", f"p|{key}|{pages - 1}")]
+        rows.append(nav)
 
-    rows.append([
-        btn("🔁 Re-run", f"r|{key}|{page}", "primary"),
-        btn("📥 Export", f"x|{key}|{page}", "success", CUSTOM_EMOJI["export"]),
-    ])
-    last_row = [btn("✖️ Close", f"close|{key}|0", "danger", CUSTOM_EMOJI["close"])]
+    rows.append([btn("📥 Export JSON", f"x|{key}|{page}", "success", CUSTOM_EMOJI["export"])])
+    tail = [btn("🗑 Close", f"close|{key}|0", "danger", CUSTOM_EMOJI["close"])]
     if not in_group:
-        last_row.insert(0, btn("🏠 Menu", "menu|0|0", None, CUSTOM_EMOJI["menu"]))
-    rows.append(last_row)
+        tail.insert(0, btn("🏠 Menu", "menu|0|0", None, CUSTOM_EMOJI["menu"]))
+    rows.append(tail)
     return text, rich_buttons(rows)
 
 
@@ -676,21 +756,20 @@ def render_detail(key: str, result: SearchResult, index: int) -> tuple[str, Inli
         (k, mask_if_sensitive(k, format_scalar(v)))
         for k, v in flatten(item if isinstance(item, dict) else {"value": item})
     ]
-    raw_json = json.dumps(item, indent=2, ensure_ascii=False, default=str)
+    raw_json = json.dumps(masked_copy(item), indent=2, ensure_ascii=False, default=str)
 
     head = (
-        f"🗂 <b>RECORD {index + 1}/{len(result.items)}</b>\n{DIV}\n"
-        f"🎯 <code>{esc(shorten(result.query, 60))}</code>\n\n"
+        f"🗂 <b>RECORD {index + 1} OF {len(result.items)}</b> ✨\n{DIV}\n"
+        f"🎯 <b>Target</b> ▸ <code>{esc(shorten(result.query, 60))}</code>\n{DIV}\n\n"
         f"{render_card(item, index, 0, 420)}\n"
     )
     text = head
     for n_pairs, n_json in ((40, 1800), (30, 1200), (20, 700), (12, 400), (6, 0)):
-        parts = [head]
-        table = block_table(pairs_all[:n_pairs])
-        parts.append(f"\n<b>All fields</b>\n{table or '<i>-</i>'}")
+        parts = [head, f"\n📋 <b>ALL FIELDS</b>\n{fields_block(pairs_all[:n_pairs]) or '<i>-</i>'}"]
         if n_json:
             snippet = raw_json[:n_json] + ("\n…" if len(raw_json) > n_json else "")
-            parts.append("\n\n" + block_expandable_quote(block_code(snippet)))
+            parts.append("\n\n🧾 <b>RAW JSON</b> <i>(tap to expand)</i>\n" + block_expandable_quote(block_code(snippet)))
+        parts.append(f"\n\n{DIV}\n{FOOTER}")
         text = "".join(parts)
         if len(text) <= MAX_MESSAGE:
             break
@@ -698,11 +777,11 @@ def render_detail(key: str, result: SearchResult, index: int) -> tuple[str, Inli
     nav: list[InlineKeyboardButton] = []
     if index > 0:
         nav.append(btn("⬅️ Prev", f"d|{key}|{index - 1}", "primary"))
-    nav.append(btn(f"· {index + 1}/{len(result.items)} ·", "noop"))
+    nav.append(btn(f"📌 {index + 1}/{len(result.items)}", "noop"))
     if index < len(result.items) - 1:
         nav.append(btn("Next ➡️", f"d|{key}|{index + 1}", "primary"))
 
-    actions = [btn("💾 Save record", f"f|{key}|{index}", "success", CUSTOM_EMOJI["save"])]
+    actions = [btn("💾 Save JSON", f"f|{key}|{index}", "success", CUSTOM_EMOJI["save"])]
     url = item_url(item)
     if url:
         actions.insert(0, link_btn("🔗 Open source", url))
@@ -711,14 +790,14 @@ def render_detail(key: str, result: SearchResult, index: int) -> tuple[str, Inli
 
 def render_raw(result: SearchResult, requester: str | None) -> str:
     parts = [
-        "🛰 <b>LOOKUP COMPLETE</b>",
+        "🛰 <b>LOOKUP COMPLETE</b> ✅",
         DIV,
-        f"🎯 <b>Target</b> · <code>{esc(shorten(result.query, 64))}</code>",
-        f"📦 <b>Records</b> · <code>{len(result.items)}</code>   ⚡ <code>{result.elapsed_ms} ms</code>",
+        f"🎯 <b>Target</b> ▸ <code>{esc(shorten(result.query, 64))}</code>",
+        f"📦 <b>Records</b> ▸ <code>{len(result.items)}</code>   ⚡ <code>{result.elapsed_ms} ms</code>",
     ]
     if requester:
-        parts.append(f"🙋 <b>Requested by</b> · {esc(requester)}")
-    header = "\n".join(parts) + "\n" + DIV + "\n\n"
+        parts.append(f"🙋 <b>Requested by</b> ▸ {esc(requester)}")
+    header = "\n".join(parts) + "\n" + DIV + "\n\n🧾 <b>RAW JSON</b>\n"
     pretty = json.dumps(result.raw, indent=2, ensure_ascii=False, default=str)
     room = MAX_MESSAGE - len(header) - 80
     if len(pretty) > room:
@@ -732,18 +811,18 @@ def render_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     logo = tg_emoji(icon, "🕵️") if icon else "🕵️"
     text = (
         f"{logo} <b>{esc(BOT_NAME)}</b>\n"
-        "<i>Open-source intelligence lookups, straight in Telegram.</i>\n"
+        "<i>Fast, private, professional intelligence lookups.</i>\n"
         f"{DIV}\n\n"
-        "Send any <b>name, username, email, phone, domain or IP</b>.\n\n"
-        "<b>How it works</b>\n"
-        "🔎 One query, matched across the connected source\n"
-        "🗂 Every hit becomes a readable record card\n"
-        "📑 Browse hits with the arrows, open any record in full\n"
-        "📥 Export a record or the whole result set as a file\n"
-        "🔐 Sensitive-looking fields are masked automatically\n\n"
+        "🔎 <b>Send</b> a name, username, email, phone, domain or IP.\n\n"
+        "✨ <b>What you get</b>\n"
+        "🗂 Clean, readable record cards\n"
+        "📑 Paged browsing with a full detail view\n"
+        "📥 One-tap JSON export\n"
+        "🔐 Auto-masked sensitive fields\n"
+        "⚡ Cached and rate-limited for speed\n\n"
         + block_expandable_quote(
             "<b>Fair use</b>\nUse this for research, verification and security work - "
-            "never for harassment, stalking or anything unlawful. Lookups are rate limited."
+            "never for harassment, stalking or anything unlawful."
         )
     )
     rows: list[list[InlineKeyboardButton]] = [
@@ -767,14 +846,14 @@ def render_admin() -> tuple[str, InlineKeyboardMarkup]:
     text = (
         f"🛠 <b>ADMIN PANEL</b>\n{DIV}\n"
         + block_table([
-            ("Uptime", f"{hours}h {minutes}m {seconds}s"),
-            ("Lookups", str(STATS["searches"])),
-            ("With hits", str(STATS["hits"])),
-            ("Failures", str(STATS["errors"])),
-            ("Users", str(len(STATS["users"]))),
-            ("Cached sets", str(len(CACHE))),
-            ("Groups", str(len(ALLOWED_GROUPS))),
-            ("Source", "connected" if RUNTIME.get("api_url") else "NOT connected"),
+            ("⏱ Uptime", f"{hours}h {minutes}m {seconds}s"),
+            ("🔎 Lookups", str(STATS["searches"])),
+            ("✅ With hits", str(STATS["hits"])),
+            ("⚠️ Failures", str(STATS["errors"])),
+            ("👥 Users", str(len(STATS["users"]))),
+            ("🗃 Cached sets", str(len(CACHE))),
+            ("🛡 Groups", f"{len(ALLOWED_GROUPS)} allowed · {len(PENDING)} pending"),
+            ("🔌 Source", "connected" if RUNTIME.get("api_url") else "NOT connected"),
         ])
         + "\n\n<code>/connect &lt;url&gt;</code> · <code>/source</code> · <code>/groups</code>\n"
         "<code>/allowgroup [id]</code> · <code>/denygroup &lt;id&gt;</code>"
@@ -786,16 +865,16 @@ def render_admin() -> tuple[str, InlineKeyboardMarkup]:
 
 HELP_TEXT = (
     f"❓ <b>HELP</b>\n{DIV}\n\n"
-    "<b>Searching</b>\n"
-    "▪️ Private chat: send a query as a normal message, or <code>/search &lt;query&gt;</code>\n"
-    "▪️ Allowed groups: <code>/num &lt;query&gt;</code> (the only command there)\n\n"
-    "<b>Reading results</b>\n"
-    "▪️ Numbered buttons open a record in full\n"
+    "🔎 <b>Searching</b>\n"
+    "▪️ Private chat: send a query, or <code>/search &lt;query&gt;</code>\n"
+    "▪️ Allowed groups: <code>/num &lt;query&gt;</code>\n\n"
+    "📖 <b>Reading results</b>\n"
+    "▪️ Name buttons open a record in full\n"
     "▪️ Arrows move between pages and records\n"
-    "▪️ 📥 exports what you are viewing · 🔁 refreshes the lookup\n\n"
-    "<b>Commands</b>\n"
+    "▪️ 📥 exports what you are viewing as JSON\n\n"
+    "⌨️ <b>Commands</b>\n"
     "<code>/search</code> <code>/num</code> <code>/recent</code> <code>/usage</code> <code>/menu</code>\n\n"
-    "<b>Admin</b>\n"
+    "🛠 <b>Admin</b>\n"
     "<code>/admin</code> <code>/connect</code> <code>/source</code> <code>/groups</code>\n"
     "<code>/allowgroup</code> <code>/denygroup</code> <code>/emojiid</code>"
 )
@@ -1150,7 +1229,7 @@ async def cmd_denygroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ALLOWED_GROUPS:
+    if not ALLOWED_GROUPS and not PENDING:
         await update.effective_message.reply_html("🛡 No groups authorized yet.")
         return
     items = list(ALLOWED_GROUPS.items())[:40]
@@ -1164,10 +1243,23 @@ async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             mark = "✅"
             note = "working (admin)" if status == ChatMemberStatus.ADMINISTRATOR else "working"
         lines.append(f"{mark} <b>{esc(meta.get('title', gid))}</b>\n   <code>{gid}</code> · {note}")
-    await update.effective_message.reply_html(
+    text = (
         f"🛡 <b>AUTHORIZED GROUPS</b>\n{DIV}\n"
-        f"✅ {ok} working · ❌ {len(items) - ok} inactive\n\n" + "\n\n".join(lines)
+        f"✅ {ok} working · ❌ {len(items) - ok} inactive · ⏳ {len(PENDING)} pending\n\n"
+        + ("\n\n".join(lines) if lines else "<i>None yet.</i>")
     )
+    markup = None
+    if PENDING:
+        text += f"\n\n{DIV}\n⏳ <b>WAITING FOR APPROVAL</b>"
+        rows = []
+        for gid, info in list(PENDING.items())[:10]:
+            text += f"\n▪️ <b>{esc(info['title'])}</b> · <code>{gid}</code> · by {esc(info['name'])}"
+            rows.append([
+                btn(f"✅ {shorten(info['title'], 16)}", f"ap|{gid}|0", "success"),
+                btn("❌ Reject", f"rj|{gid}|0", "danger"),
+            ])
+        markup = rich_buttons(rows)
+    await update.effective_message.reply_html(text, reply_markup=markup)
 
 
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1192,31 +1284,64 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"ℹ️ Added to <b>{title}</b> but not authorized.\n<code>/allowgroup {chat.id}</code>",
             )
         else:
+            PENDING[chat.id] = {
+                "title": chat.title or str(chat.id), "by": adder.id,
+                "name": adder.full_name, "ts": time.time(),
+            }
+            hours = max(1, round(PENDING_TTL / 3600))
             await notify_admins(
                 context.bot,
-                "🚫 <b>Unauthorized add blocked</b>\n"
+                f"🆕 <b>APPROVAL NEEDED</b>\n{DIV}\n"
                 + block_table([
-                    ("Group", chat.title or str(chat.id)),
-                    ("ID", str(chat.id)),
-                    ("Added by", f"{adder.full_name} ({adder.id})"),
+                    ("👥 Group", chat.title or str(chat.id)),
+                    ("🆔 ID", str(chat.id)),
+                    ("👤 Added by", f"{adder.full_name} ({adder.id})"),
                 ])
-                + f"\n\nTo allow: <code>/allowgroup {chat.id}</code>",
+                + f"\n\n<i>The bot stays silent until you decide, and leaves by itself after {hours}h.</i>",
+                rich_buttons([[
+                    btn("✅ Approve", f"ap|{chat.id}|0", "success"),
+                    btn("❌ Reject & leave", f"rj|{chat.id}|0", "danger"),
+                ]]),
             )
             try:
-                await context.bot.leave_chat(chat.id)
+                await context.bot.send_message(
+                    chat.id,
+                    "⏳ <b>Awaiting approval</b>\nThis is a private bot. The owner has been notified "
+                    "and will approve or reject this group shortly.",
+                    parse_mode=ParseMode.HTML,
+                )
             except TelegramError:
                 pass
-    elif new in gone and revoke_group(chat.id):
-        await notify_admins(
-            context.bot, f"👋 Removed from <b>{title}</b> - authorization cleared."
-        )
+    elif new in gone:
+        was_pending = PENDING.pop(chat.id, None) is not None
+        if revoke_group(chat.id):
+            await notify_admins(context.bot, f"👋 Removed from <b>{title}</b> - authorization cleared.")
+        elif was_pending:
+            await notify_admins(context.bot, f"👋 Removed from pending group <b>{title}</b>.")
+
+
+async def pending_sweeper(bot) -> None:
+    """Leave groups that were never approved."""
+    while True:
+        await asyncio.sleep(600)
+        now = time.time()
+        for gid, info in list(PENDING.items()):
+            if now - info["ts"] > PENDING_TTL:
+                PENDING.pop(gid, None)
+                try:
+                    await bot.leave_chat(gid)
+                except TelegramError:
+                    pass
+                await notify_admins(
+                    bot, f"⌛ Left <b>{esc(info['title'])}</b> - no approval within the time limit."
+                )
 
 
 # --------------------------------------------------------------------------- #
 # Callbacks                                                                    #
 # --------------------------------------------------------------------------- #
 
-KEYED_ACTIONS = {"p", "d", "r", "x", "f", "close"}
+KEYED_ACTIONS = {"p", "d", "x", "f", "close"}
 
 
 async def _safe_edit(query, text: str, markup: InlineKeyboardMarkup | None) -> None:
@@ -1254,6 +1379,56 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             who = meta["by"] if meta and meta.get("by") else "the person who ran the search"
             await query.answer(f"🔒 Only {who} can use these buttons.", show_alert=True)
             return
+
+    if action in {"ap", "rj"}:
+        if not is_admin(user_id):
+            await query.answer("Not available.", show_alert=True)
+            return
+        try:
+            gid = int(key)
+        except ValueError:
+            await query.answer("Bad request.")
+            return
+        info = PENDING.get(gid) or ALLOWED_GROUPS.get(gid) or {}
+        title = info.get("title") or str(gid)
+        done = InlineKeyboardMarkup([])
+        if action == "ap":
+            if await bot_status_in(context.bot, gid) is None:
+                PENDING.pop(gid, None)
+                await query.answer("The bot is no longer in that group.", show_alert=True)
+                await _safe_edit(query, f"⚪ <b>{esc(title)}</b> - the bot is no longer in this group.", done)
+                return
+            authorize_group(gid, title, user_id)
+            await query.answer("Approved ✅")
+            await _safe_edit(
+                query,
+                f"✅ <b>APPROVED</b>\n{DIV}\n"
+                + block_table([("👥 Group", title), ("🆔 ID", str(gid))]),
+                done,
+            )
+            try:
+                await context.bot.send_message(
+                    gid,
+                    f"✅ <b>Approved.</b>\nUse <code>/num &lt;query&gt;</code> to run a lookup.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+        else:
+            PENDING.pop(gid, None)
+            revoke_group(gid)
+            try:
+                await context.bot.leave_chat(gid)
+            except TelegramError:
+                pass
+            await query.answer("Rejected")
+            await _safe_edit(
+                query,
+                f"🚫 <b>REJECTED &amp; LEFT</b>\n{DIV}\n"
+                + block_table([("👥 Group", title), ("🆔 ID", str(gid))]),
+                done,
+            )
+        return
 
     if action == "close":
         await query.answer("Closed")
@@ -1306,43 +1481,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer("This result set expired - run the lookup again.", show_alert=True)
         return
 
-    if action == "r":
-        blocked = quota_check(user_id)
-        if blocked:
-            await query.answer(blocked, show_alert=True)
-            return
-        await query.answer("Refreshing…")
-        try:
-            result = await run_search(result.query)
-        except (ApiError, NotConfigured) as exc:
-            await query.answer(str(exc)[:190] or "Refresh failed.", show_alert=True)
-            return
-        except Exception:  # noqa: BLE001
-            log.exception("refresh failed")
-            await query.answer("Refresh failed.", show_alert=True)
-            return
-        if not result.items:
-            await query.answer("No records on refresh.", show_alert=True)
-            return
-        CACHE[key] = result
-        action = "p"
-    else:
-        if action in {"x", "f"}:
-            payload = result.raw if action == "x" else result.items[min(index, len(result.items) - 1)]
-            blob = json.dumps(payload, indent=2, ensure_ascii=False, default=str).encode("utf-8")
-            safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", result.query)[:40] or "lookup"
-            name = f"{safe}{'' if action == 'x' else f'_record_{index + 1}'}.json"
-            await query.answer("Preparing file…")
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                document=InputFile(io.BytesIO(blob), filename=name),
-                caption=(
-                    f"📥 <b>{esc(shorten(result.query, 50))}</b> · "
-                    f"{'full result set' if action == 'x' else f'record {index + 1}'}"
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-            return
+    if action in {"x", "f"}:
+        record = min(index, len(result.items) - 1)
+        payload = export_payload(result, None if action == "x" else record)
+        blob = json.dumps(payload, indent=2, ensure_ascii=False, default=str).encode("utf-8")
+        safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", result.query)[:40] or "lookup"
+        name = f"{safe}_results.json" if action == "x" else f"{safe}_record_{record + 1}.json"
+        await query.answer("Preparing file…")
+        await context.bot.send_document(
+            chat_id=query.message.chat_id,
+            document=InputFile(io.BytesIO(blob), filename=name),
+            caption=(
+                f"📥 <b>EXPORT READY</b>\n"
+                f"🎯 <code>{esc(shorten(result.query, 50))}</code>\n"
+                f"📦 {'Full result set · ' + str(len(result.items)) + ' records' if action == 'x' else 'Record ' + str(record + 1)}"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
     if action == "p":
         text, markup = render_results(key, result, index)
@@ -1403,6 +1559,7 @@ async def post_init(app: Application) -> None:
         except TelegramError as exc:
             log.warning("could not set admin commands for %s: %s", admin_id, exc)
 
+    app.bot_data["sweeper"] = asyncio.create_task(pending_sweeper(bot))
     me = await bot.get_me()
     log.info(
         "Online as @%s | source %s | %d admin(s) | %d group(s)",
@@ -1418,7 +1575,10 @@ async def post_init(app: Application) -> None:
     )
 
 
-async def post_shutdown(_: Application) -> None:
+async def post_shutdown(app: Application) -> None:
+    task = app.bot_data.get("sweeper")
+    if task:
+        task.cancel()
     if _SESSION and not _SESSION.closed:
         await _SESSION.close()
 
