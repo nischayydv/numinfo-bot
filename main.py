@@ -1351,7 +1351,7 @@ async def do_search(update: Update, query: str, force_cards: bool = False) -> No
         await message.reply_html("🛠 <b>Maintenance</b>\nLookups are paused for a moment. Please try again soon.")
         return
     if len(query) < MIN_QUERY:
-        await message.reply_html(f"🔎 Please provide at least <b>{MIN_QUERY}</b> characters.")
+        await message.reply_html(f"🔎 Please provide <b>{MIN_QUERY}</b> digit Number.")
         return
     blocked = quota_check(user_id)
     if blocked:
@@ -1404,7 +1404,7 @@ async def do_search(update: Update, query: str, force_cards: bool = False) -> No
     if not result.items:
         await placeholder.edit_text(
             f"🫥 <b>No records</b>\n🎯 <code>{esc(shorten(query, 60))}</code>\n"
-            "<i>Try a different spelling, a username, or a full email address.</i>"
+            "<i>Try another Number !</i>"
             + delete_note(),
             parse_mode=ParseMode.HTML,
             reply_markup=None if group else rich_buttons([[btn("🏠 Menu", "menu|0|0", "primary")]]),
