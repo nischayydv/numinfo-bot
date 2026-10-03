@@ -26,9 +26,22 @@ Custom commands (owner-defined, no redeploy)
 title, header emoji (Premium emoji OK), API URL, button colour, per-field icons, hidden
 fields, footer note, min length, private headers, test, enable/disable, delete.
 
+Storage
+-------
+Set MONGODB_URI (and optionally MONGODB_DB) and the bot keeps groups, approvals, custom commands,
+settings, bans, protected queries and per-user usage counters in MongoDB. Without it (or if the
+database is unreachable) it falls back to local JSON files.
+
+Per-command control
+-------------------
+Every custom command has its own cooldown, per-user daily limit, auto-delete timer, no-logging
+switch and blocked-query list; anything left on 'global' follows /admin -> Settings.
+Protected queries (/block, /unblock or Control center) are refused on EVERY command.
+
 Environment variables
 ---------------------
 BOT_TOKEN, ADMIN_IDS (required)
+MONGODB_URI, MONGODB_DB (default osint_bot)
 SEARCH_API_URL, API_HEADERS, WEBHOOK_URL (falls back to RENDER_EXTERNAL_URL), WEBHOOK_SECRET
 GROUPS_FILE   default allowed_groups.json   (use /data/... on a persistent disk)
 STATE_FILE    default bot_state.json        (settings + ban list; same advice)
@@ -38,23 +51,7 @@ AUTO_APPROVE_ADMIN_ADDS (1), SILENT_DENY (0), GROUP_RAW (0), PENDING_TTL_HOURS (
 PAGE_SIZE, REQUEST_TIMEOUT, COOLDOWN_SECONDS, DAILY_LIMIT, MIN_QUERY, QUERY_CACHE_TTL,
 BOT_NAME, EMOJI_SEARCH
 
-MongoDB (optional but recommended)
----------------------------------
-MONGO_URI   mongodb+srv://... connection string. When set, custom commands, group approvals,
-            pending groups, settings, ban list, blocked queries, user limits and daily usage
-            are stored in MongoDB (survives restarts / redeploys). Without it -> JSON files.
-MONGO_DB    database name (default osint_bot)
-
-Blocked queries / per-command limits
-------------------------------------
-/block <query> [cmd]   never search this query (all commands, or only /cmd)
-/unblock <query> [cmd] /blocked
-/setlimit <user_id> <n|off> [cmd]  personal daily limit (every command or one command)
-Every command (/search, /num, each custom command) has its OWN daily counter per user:
-DAILY_LIMIT=50 means 50 lookups on /search AND 50 on /num AND 50 on each custom command.
-/cmds -> per-command daily limit, cooldown, blocked queries, user limits.
-
-Requirements: python-telegram-bot[rate-limiter,webhooks]>=22.7, aiohttp, pymongo[srv]>=4.6
+Requirements: python-telegram-bot[rate-limiter,webhooks]>=22.7, aiohttp
 """
 
 from __future__ import annotations
@@ -70,6 +67,7 @@ import re
 import secrets
 import time
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 from urllib.parse import quote, urlparse
@@ -131,15 +129,13 @@ QUERY_TTL = float(os.environ.get("QUERY_CACHE_TTL", "90"))
 WEBHOOK_URL = (
     os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://numinfo-bot-eeek.onrender.com"
 ).strip().rstrip("/")
-
-# --- ADD THIS ---
-PORT = int(os.environ.get("PORT", "8080"))
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip() or None
+PORT = int(os.environ.get("PORT", "10000"))
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip() or secrets.token_urlsafe(24)
 
 GROUPS_FILE = os.environ.get("GROUPS_FILE", "allowed_groups.json")
 STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")
-MONGO_URI = os.environ.get("MONGO_URI", "").strip()
-MONGO_DB = os.environ.get("MONGO_DB", "osint_bot").strip() or "osint_bot"
+MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
+MONGODB_DB = os.environ.get("MONGODB_DB", "osint_bot").strip() or "osint_bot"
 SEED_GROUPS = os.environ.get("ALLOWED_GROUPS", "")
 SILENT_DENY = _env_bool("SILENT_DENY")
 AUTO_APPROVE_ADMIN_ADDS = _env_bool("AUTO_APPROVE_ADMIN_ADDS", "1")
@@ -157,8 +153,9 @@ SETTINGS: dict[str, Any] = {
     "members_can_search": _env_bool("GROUP_MEMBERS_CAN_SEARCH", "1"),
     "group_raw": _env_bool("GROUP_RAW"),
     "mask": True,
+    "no_log": _env_bool("NO_LOG"),  # never keep query text in logs / history
     "cooldown": float(os.environ.get("COOLDOWN_SECONDS", "3")),
-    "daily_limit": int(os.environ.get("DAILY_LIMIT", "50")),  # per command, per user, 0 = unlimited (admins exempt)
+    "daily_limit": int(os.environ.get("DAILY_LIMIT", "50")),  # 0 = unlimited (admins exempt)
 }
 
 logging.basicConfig(
@@ -227,11 +224,8 @@ class SearchResult:
 CACHE: dict[str, SearchResult] = {}
 META: dict[str, dict[str, Any]] = {}  # cache key -> {owner, group, by, born}
 HISTORY: dict[int, deque[str]] = {}
-LAST_CALL: dict[int, float] = {}
-CMD_USAGE: dict[tuple[int, str], tuple[str, int]] = {}  # (user, command) -> (day, count)
-CMD_LAST: dict[tuple[int, str], float] = {}
-USER_LIMITS: dict[int, int] = {}       # personal global daily limit overrides
-BLOCKED_QUERIES: set[str] = set()      # never searched on ANY command
+LAST_CALL: dict[tuple[int, str], float] = {}          # (user, command) -> last call
+USAGE: dict[tuple[int, str], tuple[str, int]] = {}    # (user, command) -> (day, count)
 RUNTIME: dict[str, Any] = {"api_url": SEARCH_API_URL}
 STATS: dict[str, Any] = {
     "searches": 0, "hits": 0, "errors": 0, "lat_total": 0, "lat_n": 0,
@@ -241,21 +235,25 @@ LOG: deque[dict[str, Any]] = deque(maxlen=100)  # activity / audit log
 USER_STATS: dict[int, dict[str, Any]] = {}
 BANNED: set[int] = set()
 SOURCES: dict[str, dict[str, Any]] = {}  # owner-defined custom commands
+BLOCKED: set[str] = set()                # protected queries (normalised) - refused on every command
+STORE: Any = None
+STORAGE: dict[str, Any] = {"kind": "files", "errors": 0, "note": ""}
 INPUT: dict[int, dict[str, Any]] = {}    # admin id -> pending text-input state
 INPUT_TTL = 300
 
 RESERVED = {
     "start", "menu", "help", "search", "recent", "usage", "emojiid", "admin", "connect", "source",
     "groups", "denygroup", "allowgroup", "banned", "ban", "unban", "num", "addcmd", "cmds",
-    "delcmd", "cancel", "block", "unblock", "blocked", "setlimit",
+    "delcmd", "cancel", "block", "unblock",
 }
 CMD_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 STYLE_CYCLE = ["primary", "success", "danger", "default"]
 SOURCE_DEFAULTS: dict[str, Any] = {
     "url": "", "title": "", "emoji": "🛰", "emoji_id": None, "style": "primary",
     "icons": {}, "hide": [], "footer": "", "min_len": MIN_QUERY, "headers": {}, "enabled": True,
-    # per-command limits: 0 = fall back to the global setting
-    "daily_limit": 0, "cooldown": 0, "blocked": [], "user_limits": {},
+    # per-command overrides: None = follow the global setting
+    "cooldown": None, "daily_limit": None, "auto_delete": None, "no_log": None, "blocked": [],
+    "maintenance": False, "maint_msg": "",
 }
 DEFAULT_PROFILE: dict[str, Any] = {
     "emoji": "🛰", "emoji_id": None, "title": "Lookup", "style": "primary",
@@ -293,6 +291,56 @@ def hidden(label: str, hide: list[str]) -> bool:
 
 def host_of(url: str) -> str:
     return urlparse(url).netloc or "?"
+
+
+def eff(p: dict[str, Any], key: str) -> Any:
+    """Effective setting: the command's own value, or the global one when left on 'global'."""
+    v = p.get(key)
+    return SETTINGS[key] if v is None else v
+
+
+def norm_query(q: str) -> str:
+    """Canonical form so +91 98765-43210, 919876543210 and 9876543210 are all the same query."""
+    q = q.strip().casefold()
+    digits = re.sub(r"[\s\-().+]", "", q)
+    if digits.isdigit() and len(digits) >= 7:
+        return "n:" + (digits[-10:] if len(digits) >= 10 else digits)
+    return "t:" + q.lstrip("@")
+
+
+def mask_norm(n: str) -> str:
+    body = n[2:]
+    if len(body) <= 4:
+        return "••••"
+    return body[:2] + "•" * max(2, min(8, len(body) - 4)) + body[-2:]
+
+
+def qtok(n: str) -> str:
+    return hashlib.sha1(n.encode("utf-8")).hexdigest()[:8]
+
+
+def parse_block_input(text: str) -> list[str]:
+    out = []
+    for part in re.split(r"[\n,;]+", text):
+        part = part.strip()
+        if len(part) >= 3:
+            out.append(norm_query(part))
+    return list(dict.fromkeys(out))
+
+
+def is_blocked(query: str, name: str | None) -> bool:
+    n = norm_query(query)
+    if n in BLOCKED:
+        return True
+    src = SOURCES.get(name) if name else None
+    return bool(src) and n in set(src.get("blocked") or [])
+
+
+def storage_label() -> str:
+    base = "🟢 MongoDB" if STORAGE["kind"] == "mongo" else "🟡 Local files"
+    if STORAGE["errors"]:
+        base += f" · ⚠️ {STORAGE['errors']} write error(s)"
+    return base
 
 ALLOWED_GROUPS: dict[int, dict[str, Any]] = {}
 PENDING: dict[int, dict[str, Any]] = {}
@@ -333,90 +381,55 @@ def qtoken(query: str) -> str:
     return hashlib.sha1(query.encode("utf-8")).hexdigest()[:8]
 
 
-def norm_query(q: str) -> str:
-    """Normalise so '+91 98765-43210', '9876543210' and '919876543210' can match."""
-    return re.sub(r"[\s\-+().]", "", (q or "").lower())
+def persist_usage(day: str, uid: int, name: str | None, count: int) -> None:
+    if STORE is None or STORE.kind != "mongo":
+        return
+
+    async def _write() -> None:
+        try:
+            await STORE.save_usage(day, uid, name or "-", count)
+        except Exception as exc:  # noqa: BLE001
+            STORAGE["errors"] += 1
+            log.error("usage write failed: %s", type(exc).__name__)
+
+    try:
+        spawn(_write())
+    except RuntimeError:
+        pass
 
 
-def is_blocked(query: str, source: str | None = None) -> bool:
-    nq = norm_query(query)
-    if not nq:
-        return False
-    terms = set(BLOCKED_QUERIES)
-    src = SOURCES.get(source) if source else None
-    if src:
-        terms.update(src.get("blocked") or [])
-    for t in terms:
-        if not t:
-            continue
-        if nq == t or (len(t) >= 6 and (t in nq or nq in t and len(nq) >= 6)):
-            return True
-    return False
-
-
-def _bump(store: dict, key, limit: int, label: str) -> str | None:
-    today = today_utc()
-    day, count = store.get(key, (today, 0))
-    if day != today:
-        day, count = today, 0
-    if count >= limit:
-        return f"🚦 Daily limit reached for {label} ({limit} lookups). Resets at midnight UTC."
-    return None
-
-
-def cmd_limit_for(user_id: int, source: str) -> int:
-    src = SOURCES.get(source) or {}
-    per_user = (src.get("user_limits") or {}).get(str(user_id))
-    if per_user is not None:
-        return int(per_user)
-    return int(src.get("daily_limit") or 0)
-
-
-def global_limit_for(user_id: int) -> int:
-    if user_id in USER_LIMITS:
-        return int(USER_LIMITS[user_id])
-    return int(SETTINGS["daily_limit"])
-
-
-def quota_check(user_id: int, source: str | None = None) -> str | None:
+def quota_check(user_id: int, name: str | None = None) -> str | None:
+    """Per-user, per-command cooldown and daily limit (command overrides fall back to global)."""
+    p = profile(name)
+    label = f"/{name}" if name else "/num"
     now = time.time()
-    src = SOURCES.get(source) if source else None
-    # cooldown: per-command if set, else global
-    if src and float(src.get("cooldown") or 0) > 0:
-        cd = float(src["cooldown"])
-        last = CMD_LAST.get((user_id, source), 0.0)
-    else:
-        cd = float(SETTINGS["cooldown"])
-        last = LAST_CALL.get(user_id, 0.0)
-    if now - last < cd:
-        return f"⏳ Easy there - try again in {max(1, round(cd - (now - last)))}s."
-    if not is_admin(user_id):
-        # Every command has its OWN daily counter per user: /search, /num and each
-        # custom command each get the full limit - usage on one never eats another's.
-        cmd = source or "search"
-        limit = cmd_limit_for(user_id, source) if src else 0
-        if not limit:
-            limit = global_limit_for(user_id)  # default per-command limit
-        if limit:
-            msg = _bump(CMD_USAGE, (user_id, cmd), limit, f"/{cmd}")
-            if msg:
-                return msg
-            today = today_utc()
-            day, count = CMD_USAGE.get((user_id, cmd), (today, 0))
-            CMD_USAGE[(user_id, cmd)] = (today, (count if day == today else 0) + 1)
-            db_inc_usage(user_id, cmd, today)
-    LAST_CALL[user_id] = now
-    if src:
-        CMD_LAST[(user_id, source)] = now
+    cooldown = float(eff(p, "cooldown"))
+    ukey = (user_id, name or "-")
+    last = LAST_CALL.get(ukey, 0.0)
+    if now - last < cooldown:
+        return f"⏳ Easy there - try {label} again in {max(1, round(cooldown - (now - last)))}s."
+    limit = int(eff(p, "daily_limit"))
+    if limit and not is_admin(user_id):
+        today = today_utc()
+        day, count = USAGE.get(ukey, (today, 0))
+        if day != today:
+            day, count = today, 0
+        if count >= limit:
+            return f"🚦 Daily limit reached for {label} ({limit} lookups per user). Resets at midnight UTC."
+        USAGE[ukey] = (day, count + 1)
+        persist_usage(today, user_id, name, count + 1)
+    LAST_CALL[ukey] = now
     return None
 
 
-def record_activity(user, chat, query: str, hits: int, ms: int, status: str, cmd: str | None = None) -> None:
+def record_activity(user, chat, query: str, hits: int, ms: int, status: str,
+                    cmd: str | None = None, hide_query: bool = False) -> None:
     uid = user.id if user else 0
     name = (user.full_name if user else "?") or "?"
     where = "DM" if chat is None or chat.type == ChatType.PRIVATE else (chat.title or str(chat.id))
     LOG.append({"ts": time.time(), "uid": uid, "name": name, "where": where,
-                "query": query, "hits": hits, "ms": ms, "status": status, "cmd": cmd})
+                "query": "(hidden)" if hide_query else query, "hits": hits, "ms": ms,
+                "status": status, "cmd": cmd})
     entry = USER_STATS.setdefault(uid, {"name": name, "count": 0, "last": 0.0})
     entry.update(name=name, last=time.time())
     entry["count"] += 1
@@ -439,113 +452,22 @@ def _atomic_dump(path: str, data: Any, secret: bool = False) -> None:
         log.exception("could not persist %s", path)
 
 
-# ----------------------------- MongoDB layer ------------------------------- #
-_MDB = None
+def _sig(doc: Any) -> str:
+    return json.dumps(doc, sort_keys=True, default=str)
 
 
-def mdb():
-    """Lazy pymongo database handle (None when MONGO_URI is not set)."""
-    global _MDB
-    if _MDB is None and MONGO_URI:
-        from pymongo import MongoClient  # imported lazily so JSON mode needs no pymongo
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000, appname="osint-bot")
-        client.admin.command("ping")
-        _MDB = client[MONGO_DB]
-        log.info("MongoDB connected (db=%s)", MONGO_DB)
-    return _MDB
+def snapshot() -> dict[str, Any]:
+    return {
+        "groups": {int(k): dict(v) for k, v in ALLOWED_GROUPS.items()},
+        "settings": dict(SETTINGS),
+        "banned": sorted(BANNED),
+        "sources": json.loads(json.dumps(SOURCES)),
+        "blocked": sorted(BLOCKED),
+    }
 
 
-def _db_run(fn) -> None:
-    """Run a blocking DB write off the event loop when one is running."""
-    if not MONGO_URI:
-        return
-
-    def safe():
-        try:
-            fn(mdb())
-        except Exception:  # noqa: BLE001
-            log.exception("MongoDB write failed")
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        safe()
-        return
-    loop.run_in_executor(None, safe)
-
-
-def db_inc_usage(uid: int, cmd: str, day: str) -> None:
-    _db_run(lambda d: d.usage.update_one(
-        {"_id": f"{uid}:{cmd}:{day}"},
-        {"$inc": {"count": 1}, "$set": {"uid": uid, "cmd": cmd, "day": day}}, upsert=True))
-
-
-def _sync_collection(coll, docs: dict[str, dict]) -> None:
-    from pymongo import ReplaceOne
-    ops = [ReplaceOne({"_id": k}, {**v, "_id": k}, upsert=True) for k, v in docs.items()]
-    if ops:
-        coll.bulk_write(ops, ordered=False)
-    coll.delete_many({"_id": {"$nin": list(docs.keys())}})
-
-
-def _mongo_load() -> None:
-    d = mdb()
-    for doc in d.groups.find():
-        ALLOWED_GROUPS[int(doc["_id"])] = {k: v for k, v in doc.items() if k != "_id"}
-    for doc in d.pending.find():
-        PENDING[int(doc["_id"])] = {k: v for k, v in doc.items() if k != "_id"}
-    state = d.state.find_one({"_id": "state"}) or {}
-    _apply_state(state)
-    sources = {}
-    for doc in d.commands.find():
-        sources[doc["_id"]] = {k: v for k, v in doc.items() if k != "_id"}
-    _apply_sources(sources)
-    today = today_utc()
-    for doc in d.usage.find({"day": today}):
-        cmd = doc.get("cmd") or "search"
-        if cmd == "*":  # legacy pooled counter -> belongs to the built-in search
-            cmd = "search"
-        CMD_USAGE[(int(doc["uid"]), cmd)] = (today, int(doc.get("count", 0)))
-    d.usage.delete_many({"day": {"$ne": today}})
-    log.info("MongoDB loaded: %d group(s), %d pending, %d command(s), %d blocked",
-             len(ALLOWED_GROUPS), len(PENDING), len(SOURCES), len(BLOCKED_QUERIES))
-
-
-def load_groups() -> None:
-    if MONGO_URI:
-        _mongo_load()
-        for gid in re.split(r"[,\s]+", SEED_GROUPS):
-            if gid.lstrip("-").isdigit() and int(gid) not in ALLOWED_GROUPS:
-                ALLOWED_GROUPS[int(gid)] = {"title": "seeded", "by": 0, "ts": int(time.time())}
-                save_groups()
-        return
-    try:
-        with open(GROUPS_FILE, encoding="utf-8") as fh:
-            ALLOWED_GROUPS.update({int(k): v for k, v in json.load(fh).items()})
-    except FileNotFoundError:
-        pass
-    except Exception:  # noqa: BLE001
-        log.exception("could not read %s", GROUPS_FILE)
-    for gid in re.split(r"[,\s]+", SEED_GROUPS):
-        if gid.lstrip("-").isdigit():
-            ALLOWED_GROUPS.setdefault(int(gid), {"title": "seeded", "by": 0, "ts": int(time.time())})
-
-
-def save_groups() -> None:
-    """Persists approved AND pending groups."""
-    if MONGO_URI:
-        groups = {str(k): dict(v) for k, v in ALLOWED_GROUPS.items()}
-        pending = {str(k): dict(v) for k, v in PENDING.items()}
-
-        def w(d):
-            _sync_collection(d.groups, groups)
-            _sync_collection(d.pending, pending)
-        _db_run(w)
-        return
-    _atomic_dump(GROUPS_FILE, {str(k): v for k, v in ALLOWED_GROUPS.items()})
-
-
-def _apply_state(data: dict) -> None:
+def apply_loaded(data: dict[str, Any]) -> None:
+    ALLOWED_GROUPS.update({int(k): v for k, v in (data.get("groups") or {}).items()})
     for key, value in (data.get("settings") or {}).items():
         if key in SETTINGS:
             current = SETTINGS[key]
@@ -554,54 +476,225 @@ def _apply_state(data: dict) -> None:
             except (TypeError, ValueError):
                 pass
     BANNED.update(int(x) for x in data.get("banned", []) if str(x).lstrip("-").isdigit())
-    BLOCKED_QUERIES.update(str(x) for x in data.get("blocked", []) if x)
-    for k, v in (data.get("user_limits") or {}).items():
-        if str(k).lstrip("-").isdigit():
-            USER_LIMITS[int(k)] = int(v)
-
-
-def _apply_sources(sources: dict) -> None:
-    for name, conf in (sources or {}).items():
+    BLOCKED.update(str(x) for x in data.get("blocked", []))
+    for name, conf in (data.get("sources") or {}).items():
         if CMD_RE.match(str(name)) and isinstance(conf, dict) and conf.get("url"):
             merged = new_source(str(name), str(conf["url"]))
             merged.update({k: v for k, v in conf.items() if k in SOURCE_DEFAULTS})
             SOURCES[str(name)] = merged
+    for row in data.get("usage", []):
+        try:
+            USAGE[(int(row["uid"]), str(row["cmd"]))] = (str(row["day"]), int(row["count"]))
+        except (KeyError, TypeError, ValueError):
+            pass
 
 
-def load_state() -> None:
-    if MONGO_URI:
-        return  # already loaded together with groups in load_groups()
+class FileStore:
+    """Fallback storage: two small JSON files (lost on redeploy unless on a persistent disk)."""
+
+    kind = "files"
+
+    async def connect(self) -> None:
+        return None
+
+    async def load(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"groups": {}, "settings": {}, "banned": [], "sources": {}, "blocked": [], "usage": []}
+        try:
+            with open(GROUPS_FILE, encoding="utf-8") as fh:
+                data["groups"] = json.load(fh)
+        except FileNotFoundError:
+            pass
+        except Exception:  # noqa: BLE001
+            log.exception("could not read %s", GROUPS_FILE)
+        try:
+            with open(STATE_FILE, encoding="utf-8") as fh:
+                state = json.load(fh)
+            for k in ("settings", "banned", "sources", "blocked"):
+                data[k] = state.get(k, data[k])
+        except FileNotFoundError:
+            pass
+        except Exception:  # noqa: BLE001
+            log.exception("could not read %s", STATE_FILE)
+        return data
+
+    def _write(self, snap: dict[str, Any]) -> None:
+        _atomic_dump(GROUPS_FILE, {str(k): v for k, v in snap["groups"].items()})
+        _atomic_dump(STATE_FILE, {k: snap[k] for k in ("settings", "banned", "sources", "blocked")}, secret=True)
+
+    async def save(self, snap: dict[str, Any]) -> None:
+        await asyncio.to_thread(self._write, snap)
+
+    async def save_usage(self, *_: Any) -> None:
+        return None
+
+    async def ping(self) -> tuple[bool, str]:
+        return True, "🟡 Local files (no database configured)"
+
+    async def close(self) -> None:
+        return None
+
+
+class MongoStore:
+    """MongoDB storage (PyMongo async). Only changed documents are written."""
+
+    kind = "mongo"
+
+    def __init__(self, uri: str, dbname: str) -> None:
+        self.uri, self.dbname = uri, dbname
+        self.client: Any = None
+        self.db: Any = None
+        self._sig: dict[tuple[str, Any], str] = {}
+
+    async def connect(self) -> None:
+        from pymongo import AsyncMongoClient
+
+        self.client = AsyncMongoClient(self.uri, serverSelectionTimeoutMS=8000)
+        await self.client.admin.command("ping")
+        self.db = self.client[self.dbname]
+        try:  # per-user usage counters expire on their own
+            await self.db["usage"].create_index("exp", expireAfterSeconds=0)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _all(self, coll: str, flt: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        return await self.db[coll].find(flt or {}).to_list(length=None)
+
+    def _prime(self, coll: str, docs: list[dict[str, Any]]) -> None:
+        for d in docs:
+            self._sig[(coll, d["_id"])] = _sig(d)
+
+    async def load(self) -> dict[str, Any]:
+        groups_docs = await self._all("groups")
+        source_docs = await self._all("sources")
+        ban_docs = await self._all("bans")
+        blocked_docs = await self._all("blocked")
+        settings_doc = await self.db["settings"].find_one({"_id": "global"}) or {}
+        usage_docs = await self._all("usage", {"day": today_utc()})
+        for coll, docs in (("groups", groups_docs), ("sources", source_docs), ("bans", ban_docs),
+                           ("blocked", blocked_docs), ("settings", [settings_doc] if settings_doc else [])):
+            self._prime(coll, docs)
+        strip = lambda d: {k: v for k, v in d.items() if k != "_id"}  # noqa: E731
+        return {
+            "groups": {int(d["_id"]): strip(d) for d in groups_docs},
+            "settings": strip(settings_doc),
+            "banned": [int(d["_id"]) for d in ban_docs],
+            "sources": {str(d["_id"]): strip(d) for d in source_docs},
+            "blocked": [str(d["_id"]) for d in blocked_docs],
+            "usage": [{"uid": d["uid"], "cmd": d["cmd"], "day": d["day"], "count": d["count"]} for d in usage_docs],
+        }
+
+    async def _sync(self, coll: str, docs: list[dict[str, Any]]) -> None:
+        c = self.db[coll]
+        ids = {d["_id"] for d in docs}
+        for d in docs:
+            sg = _sig(d)
+            if self._sig.get((coll, d["_id"])) != sg:
+                await c.replace_one({"_id": d["_id"]}, d, upsert=True)
+                self._sig[(coll, d["_id"])] = sg
+        gone = [k[1] for k in self._sig if k[0] == coll and k[1] not in ids]
+        if gone:
+            await c.delete_many({"_id": {"$in": gone}})
+            for gid in gone:
+                self._sig.pop((coll, gid), None)
+
+    async def save(self, snap: dict[str, Any]) -> None:
+        await self._sync("groups", [{"_id": gid, **meta} for gid, meta in snap["groups"].items()])
+        await self._sync("sources", [{"_id": n, **conf} for n, conf in snap["sources"].items()])
+        await self._sync("bans", [{"_id": uid} for uid in snap["banned"]])
+        await self._sync("blocked", [{"_id": n} for n in snap["blocked"]])
+        await self._sync("settings", [{"_id": "global", **snap["settings"]}])
+
+    async def save_usage(self, day: str, uid: int, cmd: str, count: int) -> None:
+        exp = datetime.now(timezone.utc) + timedelta(days=2)
+        await self.db["usage"].update_one(
+            {"_id": f"{day}:{uid}:{cmd}"},
+            {"$set": {"day": day, "uid": uid, "cmd": cmd, "count": count, "exp": exp}},
+            upsert=True,
+        )
+
+    async def ping(self) -> tuple[bool, str]:
+        started = time.perf_counter()
+        try:
+            await self.client.admin.command("ping")
+        except Exception as exc:  # noqa: BLE001
+            return False, f"🔴 MongoDB unreachable ({type(exc).__name__})"
+        return True, f"🟢 MongoDB healthy · {int((time.perf_counter() - started) * 1000)} ms"
+
+    async def close(self) -> None:
+        try:
+            await self.client.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+_FLUSH_LOCK: asyncio.Lock | None = None
+
+
+async def _flush() -> None:
+    global _FLUSH_LOCK
+    if STORE is None:
+        return
+    if _FLUSH_LOCK is None:
+        _FLUSH_LOCK = asyncio.Lock()
+    async with _FLUSH_LOCK:  # always writes the LATEST state, so ordering can't regress data
+        try:
+            await STORE.save(snapshot())
+        except Exception as exc:  # noqa: BLE001
+            STORAGE["errors"] += 1
+            log.error("storage write failed: %s", type(exc).__name__)
+
+
+def persist() -> None:
     try:
-        with open(STATE_FILE, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return
-    except Exception:  # noqa: BLE001
-        log.exception("could not read %s", STATE_FILE)
-        return
-    _apply_state(data)
-    _apply_sources(data.get("sources") or {})
-    log.info("state loaded: %d custom command(s), %d banned", len(SOURCES), len(BANNED))
+        spawn(_flush())
+    except RuntimeError:  # no running loop (tests / startup)
+        pass
+
+
+def save_groups() -> None:
+    persist()
 
 
 def save_state() -> None:
-    state = {"settings": dict(SETTINGS), "banned": sorted(BANNED), "blocked": sorted(BLOCKED_QUERIES),
-             "user_limits": {str(k): v for k, v in USER_LIMITS.items()}}
-    if MONGO_URI:
-        commands = json.loads(json.dumps(SOURCES))
+    persist()
 
-        def w(d):
-            d.state.replace_one({"_id": "state"}, {**state, "_id": "state"}, upsert=True)
-            _sync_collection(d.commands, commands)
-        _db_run(w)
-        return
-    _atomic_dump(STATE_FILE, {**state, "sources": SOURCES}, secret=True)
+
+async def init_storage() -> None:
+    global STORE
+    STORE = None
+    if MONGODB_URI:
+        try:
+            candidate = MongoStore(MONGODB_URI, MONGODB_DB)
+            await candidate.connect()
+            data = await candidate.load()
+            STORE = candidate
+        except ImportError:
+            STORAGE["note"] = "pymongo is not installed - using local files"
+        except Exception as exc:  # noqa: BLE001
+            STORAGE["note"] = f"MongoDB unreachable ({type(exc).__name__}) - using local files"
+            log.error("MongoDB connection failed: %s", type(exc).__name__)  # never log the URI
+    if STORE is None:
+        STORE = FileStore()
+        data = await STORE.load()
+    STORAGE["kind"] = STORE.kind
+    apply_loaded(data)
+
+    seeded = False
+    for gid in re.split(r"[,\s]+", SEED_GROUPS):
+        if gid.lstrip("-").isdigit() and int(gid) not in ALLOWED_GROUPS:
+            ALLOWED_GROUPS[int(gid)] = {"title": "seeded", "by": 0, "ts": int(time.time())}
+            seeded = True
+    if seeded or (STORE.kind == "mongo" and not data.get("groups") and ALLOWED_GROUPS):
+        persist()
+    log.info(
+        "storage=%s | %d group(s) | %d custom command(s) | %d banned | %d protected",
+        STORE.kind, len(ALLOWED_GROUPS), len(SOURCES), len(BANNED), len(BLOCKED),
+    )
 
 
 def authorize_group(chat_id: int, title: str | None, by: int) -> None:
     ALLOWED_GROUPS[chat_id] = {"title": title or str(chat_id), "by": by, "ts": int(time.time())}
     PENDING.pop(chat_id, None)
-    save_groups()
     save_groups()
 
 
@@ -661,8 +754,8 @@ def autodelete(bot, *messages, delay: float | None = None) -> None:
             spawn(_delete_later(bot, m.chat_id, m.message_id, delay))
 
 
-def delete_note() -> str:
-    d = SETTINGS["auto_delete"]
+def delete_note(d: float | None = None) -> str:
+    d = SETTINGS["auto_delete"] if d is None else d
     return f"\n⏳ <i>Self-destructs {fmt_dur(d)} after the lookup</i>" if d else ""
 
 
@@ -1097,7 +1190,7 @@ def render_results(key: str, result: SearchResult, page: int) -> tuple[str, Inli
     if extra:
         box.append(f"ℹ️ <i>{esc(' · '.join(extra))}</i>")
     header = f"{emoji_html(p)} <b>{esc(str(p['title']).upper())} COMPLETE</b> ✅\n{summary_box(box)}\n"
-    footer = f"\n\n{DIV}\n{FOOTER}{custom_footer(p)}{delete_note()}"
+    footer = f"\n\n{DIV}\n{FOOTER}{custom_footer(p)}{delete_note(eff(p, 'auto_delete'))}"
 
     text = header
     for budget in (5, 4, 3, 2, 1, 0):
@@ -1174,7 +1267,7 @@ def render_detail(key: str, result: SearchResult, index: int) -> tuple[str, Inli
         if n_json:
             snippet = raw_json[:n_json] + ("\n…" if len(raw_json) > n_json else "")
             parts.append("\n\n🧾 <b>RAW JSON</b> <i>(tap to expand)</i>\n" + block_expandable_quote(block_code(snippet)))
-        parts.append(f"\n\n{DIV}\n{FOOTER}{custom_footer(p)}{delete_note()}")
+        parts.append(f"\n\n{DIV}\n{FOOTER}{custom_footer(p)}{delete_note(eff(p, 'auto_delete'))}")
         text = "".join(parts)
         if len(text) <= MAX_MESSAGE:
             break
@@ -1205,7 +1298,7 @@ def render_raw(result: SearchResult, requester: str | None, p: dict[str, Any] | 
         f"{emoji_html(p)} <b>{esc(str(p['title']).upper())} COMPLETE</b> ✅\n"
         f"{summary_box(box)}\n\n🧾 <b>RAW JSON</b>\n"
     )
-    tail = custom_footer(p) + delete_note()
+    tail = custom_footer(p) + delete_note(eff(p, 'auto_delete'))
     pretty = json.dumps(masked_copy(result.raw, hide=p.get("hide") or []), indent=2, ensure_ascii=False, default=str)
     room = MAX_MESSAGE - len(header) - len(tail) - 80
     if len(pretty) > room:
@@ -1223,7 +1316,7 @@ def render_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     icon = CUSTOM_EMOJI["search"]
     logo = tg_emoji(icon, "🕵️") if icon else "🕵️"
     src = "🟢 Source online" if RUNTIME.get("api_url") else "🔴 No source"
-    cmds = [f"<code>/{n}</code>" for n, c in SOURCES.items() if c.get("enabled")]
+    cmds = [f"<code>/{n}</code>{' 🛠' if c.get('maintenance') else ''}" for n, c in SOURCES.items() if c.get("enabled")]
     cmd_line = f"🧩 <b>Commands</b> ▸ {' '.join(cmds)}\n\n" if cmds else ""
     lock = " · 🔒 Lockdown" if SETTINGS["lockdown"] else ""
     text = (
@@ -1280,7 +1373,8 @@ def render_help() -> str:
         + "\n\n🛠 <b>Admin</b>\n"
         "<code>/admin</code> <code>/groups</code> <code>/allowgroup</code> <code>/denygroup</code>\n"
         "<code>/ban</code> <code>/unban</code> <code>/banned</code> <code>/connect</code> <code>/source</code>\n"
-        "<code>/addcmd</code> <code>/cmds</code> <code>/delcmd</code>"
+        "<code>/addcmd</code> <code>/cmds</code> <code>/delcmd</code>\n"
+        "<code>/block</code> <code>/unblock</code>"
     )
 
 
@@ -1316,12 +1410,15 @@ def render_admin() -> tuple[str, InlineKeyboardMarkup]:
             ("🛡 Groups", f"{len(ALLOWED_GROUPS)} allowed · {len(PENDING)} pending"),
             ("🚫 Banned", str(len(BANNED))),
             ("🧩 Custom commands", str(len(SOURCES))),
+            ("🛡 Protected queries", str(len(BLOCKED))),
         ])
         + "\n\n⚙️ <b>STATUS</b>\n"
         + block_table([
             ("🔌 Source", "🟢 connected" if RUNTIME.get("api_url") else "🔴 NOT connected"),
             ("🧹 Auto-delete", fmt_dur(SETTINGS["auto_delete"])),
             ("🔒 Lockdown", "ON" if SETTINGS["lockdown"] else "off"),
+            ("💾 Storage", storage_label()),
+            ("🛠 In maintenance", str(sum(1 for c in SOURCES.values() if c.get("maintenance"))) + " command(s)"),
             ("🗃 Cached sets", str(len(CACHE))),
             ("⏱ Uptime", uptime),
         ])
@@ -1330,6 +1427,7 @@ def render_admin() -> tuple[str, InlineKeyboardMarkup]:
     rows = [
         [btn("⚙️ Settings", "adm|settings|0", "primary"), btn("🛡 Groups", "adm|groups|0", "primary")],
         [btn("🧩 Custom commands", "cx|_.list|0", "success")],
+        [btn("🛡 Protected queries", "adm|blocklist|0", "primary"), btn("💾 Test database", "adm|dbping|0", "success")],
         [btn("📜 Activity log", "adm|activity|0", "primary"), btn("🏆 Top users", "adm|users|0", "primary")],
         [btn("🚫 Ban list", "adm|banned|0", "primary"), btn("🩺 Test source", "adm|ping|0", "success")],
         [btn("🧹 Clear cache", "adm|clear|0", "danger"), btn("📤 Export log", "adm|log|0", "success")],
@@ -1340,7 +1438,7 @@ def render_admin() -> tuple[str, InlineKeyboardMarkup]:
 
 SETTING_KEYS = {
     "ad": "auto_delete", "dq": "delete_queries", "lock": "lockdown", "mem": "members_can_search",
-    "raw": "group_raw", "mask": "mask", "cd": "cooldown", "dl": "daily_limit",
+    "raw": "group_raw", "mask": "mask", "cd": "cooldown", "dl": "daily_limit", "nl": "no_log",
 }
 
 
@@ -1370,8 +1468,9 @@ def render_settings() -> tuple[str, InlineKeyboardMarkup]:
             ("👥 Members can search", onoff(s["members_can_search"])),
             ("🧾 Group raw JSON", onoff(s["group_raw"])),
             ("🙈 Field masking", onoff(s["mask"])),
+            ("🕵️ No query logging", onoff(s["no_log"])),
             ("⏱ Cooldown", f"{s['cooldown']:g}s"),
-            ("📅 Daily limit / command", "unlimited" if not s["daily_limit"] else str(s["daily_limit"])),
+            ("📅 Daily limit", "unlimited" if not s["daily_limit"] else str(s["daily_limit"])),
         ])
         + "\n\n<i>Changes apply instantly and are saved.</i>"
     )
@@ -1383,6 +1482,7 @@ def render_settings() -> tuple[str, InlineKeyboardMarkup]:
         [btn("📅 Daily limit per user", "noop", None)],
         _opt_row("dl", s["daily_limit"], [("∞", 0), ("25", 25), ("50", 50), ("100", 100), ("200", 200)]),
         [_toggle("dq", "Delete queries", s["delete_queries"]), _toggle("mask", "Masking", s["mask"])],
+        [_toggle("nl", "Don't log queries", s["no_log"])],
         [_toggle("mem", "Members search", s["members_can_search"]), _toggle("raw", "Group raw JSON", s["group_raw"])],
         [_toggle("lock", "Lockdown mode", s["lockdown"], danger_when_on=True)],
         ADMIN_BACK,
@@ -1619,31 +1719,28 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def usage_numbers(user_id: int) -> tuple[int, str]:
-    today = today_utc()
-    count = sum(c for (uid, _), (d, c) in CMD_USAGE.items() if uid == user_id and d == today)
-    limit = global_limit_for(user_id)
-    left = "unlimited" if not limit or is_admin(user_id) else f"{limit}/command"
+def usage_numbers(user_id: int, name: str | None = None) -> tuple[int, str]:
+    p = profile(name)
+    day, count = USAGE.get((user_id, name or "-"), (today_utc(), 0))
+    if day != today_utc():
+        count = 0
+    limit = int(eff(p, "daily_limit"))
+    left = "unlimited" if not limit or is_admin(user_id) else str(max(0, limit - count))
     return count, left
 
 
 async def cmd_usage(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     uid = uid_of(update)
-    count, left = usage_numbers(uid)
-    today = today_utc()
-    per_cmd = sorted(
-        (cmd, c) for (u, cmd), (d, c) in CMD_USAGE.items() if u == uid and d == today
-    )
-    rows = [
-        ("🔎 Lookups today", str(count)),
-        ("🎟 Daily limit", left),
-        ("⏱ Cooldown", f"{SETTINGS['cooldown']:g}s"),
-    ]
-    rows += [(f"/{cmd}", str(c)) for cmd, c in per_cmd]
-    await update.effective_message.reply_html(
-        f"📊 <b>YOUR USAGE</b>\n{DIV}\n" + block_table(rows)
-        + "\n<i>Each command has its own daily counter.</i>"
-    )
+    names: list[str | None] = [None] + [n for n, c in SOURCES.items() if c.get("enabled")]
+    lines = []
+    for n in names:
+        p = profile(n)
+        used, left = usage_numbers(uid, n)
+        lines.append(
+            f"{emoji_html(p)} <b>{'/num' if n is None else '/' + n}</b> ▸ "
+            f"<code>{used}</code> used · <code>{left}</code> left · ⏱ <code>{float(eff(p, 'cooldown')):g}s</code>"
+        )
+    await update.effective_message.reply_html(f"📊 <b>YOUR USAGE</b>\n{DIV}\n" + tree(lines))
 
 
 async def cmd_recent(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1668,16 +1765,34 @@ async def do_search(update: Update, query: str, force_cards: bool = False,
     bot = message.get_bot()
     p = profile(source)
     min_len = int(p.get("min_len") or MIN_QUERY)
+    delay = eff(p, "auto_delete")
+    nolog = bool(eff(p, "no_log"))
+
+    def clean(*msgs) -> None:
+        if delay:
+            autodelete(bot, *msgs, delay=delay)
+            if SETTINGS["delete_queries"] and update.message is not None:
+                autodelete(bot, update.message, delay=delay)
 
     if SETTINGS["lockdown"] and not is_admin(user_id):
         await message.reply_html("🛠 <b>Maintenance</b>\nLookups are paused for a moment. Please try again soon.")
         return
+    if source and p.get("maintenance") and not is_admin(user_id):
+        note = await message.reply_html(
+            f"🛠 <b>/{esc(source)} is under maintenance</b>\n"
+            f"{esc(p.get('maint_msg') or 'It will be back shortly.')}" + delete_note(delay)
+        )
+        clean(note)
+        return
     if len(query) < min_len:
         await message.reply_html(f"🔎 Please provide at least <b>{min_len}</b> characters.")
         return
-    if is_blocked(query, source):
-        record_activity(user, chat, query, 0, 0, "blocked", source)
-        await message.reply_html("🚫 <b>Protected</b>\nThis query is blocked and cannot be searched.")
+    if is_blocked(query, source):  # protected queries are refused before anything else happens
+        note = await message.reply_html(
+            "🛡 <b>Protected</b>\nLookups for this query are disabled." + delete_note(delay)
+        )
+        clean(note)
+        record_activity(user, chat, query, 0, 0, "blocked", source, hide_query=True)
         return
     blocked = quota_check(user_id, source)
     if blocked:
@@ -1693,18 +1808,13 @@ async def do_search(update: Update, query: str, force_cards: bool = False,
         f"{emoji_html(p)} <b>Scanning…</b>\n🎯 <code>{esc(shorten(query, 60))}</code>\n"
         "▰▰▱▱▱ <i>querying source</i>"
     )
-
-    delay = SETTINGS["auto_delete"]
-    if delay:
-        autodelete(bot, placeholder, delay=delay)
-        if SETTINGS["delete_queries"] and update.message is not None:
-            autodelete(bot, update.message, delay=delay)
+    clean(placeholder)
 
     started = time.perf_counter()
     try:
         result = await search_cached(query, source)
     except NotConfigured:
-        record_activity(user, chat, query, 0, 0, "unconfigured", source)
+        record_activity(user, chat, query, 0, 0, "unconfigured", source, nolog)
         await placeholder.edit_text(
             "🔌 <b>No source connected yet.</b>\nThe operator has to connect one first.",
             parse_mode=ParseMode.HTML,
@@ -1712,28 +1822,28 @@ async def do_search(update: Update, query: str, force_cards: bool = False,
         return
     except ApiError as exc:
         STATS["errors"] += 1
-        record_activity(user, chat, query, 0, int((time.perf_counter() - started) * 1000), "error", source)
+        record_activity(user, chat, query, 0, int((time.perf_counter() - started) * 1000), "error", source, nolog)
         await placeholder.edit_text(f"⚠️ {esc(exc)}", parse_mode=ParseMode.HTML)
         return
     except Exception:  # noqa: BLE001
         STATS["errors"] += 1
         log.exception("lookup failed")
-        record_activity(user, chat, query, 0, 0, "error", source)
+        record_activity(user, chat, query, 0, 0, "error", source, nolog)
         await placeholder.edit_text("💥 Something went wrong on our side. Please try again.")
         return
 
     STATS["searches"] += 1
     STATS["lat_total"] += result.elapsed_ms
     STATS["lat_n"] += 1
-    if source is None:
+    if source is None and not nolog:
         remember(user_id, query)
-    record_activity(user, chat, query, len(result.items), result.elapsed_ms, "ok", source)
+    record_activity(user, chat, query, len(result.items), result.elapsed_ms, "ok", source, nolog)
 
     if not result.items:
         await placeholder.edit_text(
             f"🫥 <b>No records</b>\n🎯 <code>{esc(shorten(query, 60))}</code>\n"
             "<i>Try a different spelling, a username, or a full email address.</i>"
-            + delete_note(),
+            + delete_note(delay),
             parse_mode=ParseMode.HTML,
             reply_markup=None if group else rich_buttons([[btn("🏠 Menu", "menu|0|0", "primary")]]),
         )
@@ -1893,7 +2003,6 @@ async def cmd_denygroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.effective_message.reply_html("Usage: <code>/denygroup &lt;chat_id&gt;</code>")
         return
     removed = PENDING.pop(gid, None) is not None
-    save_groups()
     removed = revoke_group(gid) or removed
     try:
         await context.bot.leave_chat(gid)
@@ -1946,117 +2055,6 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_html(f"✅ <b>Unbanned</b> <code>{target}</code>")
 
 
-def _split_cmd_arg(args: list[str]) -> tuple[str, str | None]:
-    """'/block 98765 tg' -> ('98765', 'tg') when the last word is an existing command."""
-    if len(args) >= 2 and args[-1].lower().lstrip("/") in SOURCES:
-        return " ".join(args[:-1]), args[-1].lower().lstrip("/")
-    return " ".join(args), None
-
-
-async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(uid_of(update)):
-        return
-    msg = update.effective_message
-    try:
-        await msg.delete()  # don't leave the protected value in chat
-    except TelegramError:
-        pass
-    query, cmd = _split_cmd_arg(context.args or [])
-    nq = norm_query(query)
-    if not nq:
-        await msg.chat.send_message("Usage: <code>/block &lt;query&gt; [command]</code>", parse_mode=ParseMode.HTML)
-        return
-    if cmd:
-        lst = set(SOURCES[cmd].get("blocked") or [])
-        lst.add(nq)
-        SOURCES[cmd]["blocked"] = sorted(lst)
-    else:
-        BLOCKED_QUERIES.add(nq)
-    save_state()
-    QUERY_CACHE.clear()
-    sent = await msg.chat.send_message(
-        f"🚫 Blocked <code>{esc(shorten(nq, 40))}</code> on {'<b>/' + esc(cmd) + '</b>' if cmd else '<b>all commands</b>'}.",
-        parse_mode=ParseMode.HTML)
-    autodelete(context.bot, sent, delay=30)
-
-
-async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(uid_of(update)):
-        return
-    query, cmd = _split_cmd_arg(context.args or [])
-    nq = norm_query(query)
-    if not nq:
-        await update.effective_message.reply_html("Usage: <code>/unblock &lt;query&gt; [command]</code>")
-        return
-    if cmd:
-        lst = set(SOURCES[cmd].get("blocked") or [])
-        found = nq in lst
-        lst.discard(nq)
-        SOURCES[cmd]["blocked"] = sorted(lst)
-    else:
-        found = nq in BLOCKED_QUERIES
-        BLOCKED_QUERIES.discard(nq)
-    save_state()
-    await update.effective_message.reply_html("✅ Unblocked." if found else "ℹ️ That query was not blocked.")
-
-
-async def cmd_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(uid_of(update)):
-        return
-    lines = [f"🌐 <b>All commands</b> ({len(BLOCKED_QUERIES)})"]
-    lines += [f"  • <code>{esc(q)}</code>" for q in sorted(BLOCKED_QUERIES)[:50]]
-    for n, s in SOURCES.items():
-        if s.get("blocked"):
-            lines.append(f"\n🧩 <b>/{esc(n)}</b> ({len(s['blocked'])})")
-            lines += [f"  • <code>{esc(q)}</code>" for q in s["blocked"][:30]]
-    sent = await update.effective_message.reply_html(
-        f"🚫 <b>BLOCKED QUERIES</b>\n{DIV}\n" + "\n".join(lines) + "\n\n<i>Auto-deletes in 60s.</i>")
-    autodelete(context.bot, sent, delay=60)
-
-
-async def cmd_setlimit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(uid_of(update)):
-        return
-    msg = update.effective_message
-    args = list(context.args or [])
-    target = None
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        target = msg.reply_to_message.from_user.id
-    elif args and args[0].lstrip("-").isdigit():
-        target = int(args.pop(0))
-    if target is None or not args:
-        await msg.reply_html(
-            "Usage: <code>/setlimit &lt;user_id&gt; &lt;n|off&gt; [command]</code>\n"
-            "<code>/setlimit 12345 10</code> → 10/day on every command\n"
-            "<code>/setlimit 12345 3 tg</code> → 3/day on /tg\n"
-            "<code>/setlimit 12345 off tg</code> → remove override")
-        return
-    val = args[0].lower()
-    cmd = args[1].lower().lstrip("/") if len(args) > 1 else None
-    if cmd and cmd not in SOURCES:
-        await msg.reply_html(f"❓ No command <code>/{esc(cmd)}</code>.")
-        return
-    if val != "off" and not val.isdigit():
-        await msg.reply_html("Limit must be a number or <code>off</code>.")
-        return
-    if cmd:
-        ul = dict(SOURCES[cmd].get("user_limits") or {})
-        if val == "off":
-            ul.pop(str(target), None)
-        else:
-            ul[str(target)] = int(val)
-        SOURCES[cmd]["user_limits"] = ul
-    else:
-        if val == "off":
-            USER_LIMITS.pop(target, None)
-        else:
-            USER_LIMITS[target] = int(val)
-    save_state()
-    where = f"/{cmd}" if cmd else "all lookups"
-    await msg.reply_html(
-        f"✅ <code>{target}</code> · {esc(where)} → <b>{'default' if val == 'off' else val + '/day'}</b>")
-
-
 async def cmd_banned(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     text, markup = render_banned()
     await update.effective_message.reply_html(text, reply_markup=markup)
@@ -2088,7 +2086,6 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 "title": chat.title or str(chat.id), "by": adder.id,
                 "name": adder.full_name, "ts": time.time(),
             }
-            save_groups()
             hours = max(1, round(PENDING_TTL / 3600))
             await notify_admins(
                 context.bot,
@@ -2115,7 +2112,6 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 pass
     elif new in gone:
         was_pending = PENDING.pop(chat.id, None) is not None
-        save_groups()
         if revoke_group(chat.id):
             await notify_admins(context.bot, f"👋 Removed from <b>{title}</b> - authorization cleared.")
         elif was_pending:
@@ -2129,7 +2125,6 @@ async def pending_sweeper(bot) -> None:
         for gid, info in list(PENDING.items()):
             if now - info["ts"] > PENDING_TTL:
                 PENDING.pop(gid, None)
-                save_groups()
                 try:
                     await bot.leave_chat(gid)
                 except TelegramError:
@@ -2152,16 +2147,14 @@ ADMIN_COMMANDS = [
     BotCommand("cmds", "Manage custom commands"),
     BotCommand("addcmd", "Add a custom command"),
     BotCommand("delcmd", "Delete a custom command"),
+    BotCommand("block", "Protect a query from lookups"),
+    BotCommand("unblock", "Remove a protected query"),
     BotCommand("groups", "Manage groups"),
     BotCommand("allowgroup", "Authorize a group"),
     BotCommand("denygroup", "Revoke a group"),
     BotCommand("ban", "Ban a user"),
     BotCommand("unban", "Unban a user"),
     BotCommand("banned", "Show the ban list"),
-    BotCommand("block", "Block a query from being searched"),
-    BotCommand("unblock", "Unblock a query"),
-    BotCommand("blocked", "List blocked queries"),
-    BotCommand("setlimit", "Set a user's daily limit"),
     BotCommand("connect", "Connect the default data source"),
     BotCommand("source", "Show the default source"),
     BotCommand("emojiid", "Extract a custom emoji's ID"),
@@ -2174,7 +2167,7 @@ async def refresh_commands(bot) -> None:
     custom = []
     for name, src in SOURCES.items():
         if src.get("enabled"):
-            desc = shorten(f"{src.get('emoji') or ''} {src.get('title') or name}".strip(), 200)
+            desc = shorten(f"{'🛠 ' if src.get('maintenance') else ''}{src.get('emoji') or ''} {src.get('title') or name}".strip(), 200)
             custom.append(BotCommand(name, desc or name))
     custom = custom[:60]
     try:
@@ -2194,7 +2187,7 @@ async def refresh_commands(bot) -> None:
 def render_cmd_list() -> tuple[str, InlineKeyboardMarkup]:
     if SOURCES:
         lines = [
-            f"{'🟢' if s.get('enabled') else '⚪'} {esc(s.get('emoji') or '')} <b>/{n}</b> ▸ {esc(s.get('title', n))} · <code>{esc(host_of(s['url']))}</code>"
+            f"{'🛠' if s.get('maintenance') else ('🟢' if s.get('enabled') else '⚪')} {esc(s.get('emoji') or '')} <b>/{n}</b> ▸ {esc(s.get('title', n))} · <code>{esc(host_of(s['url']))}</code>"
             for n, s in SOURCES.items()
         ]
         body = "\n".join(lines)
@@ -2210,6 +2203,87 @@ def render_cmd_list() -> tuple[str, InlineKeyboardMarkup]:
         for n, s in SOURCES.items()
     ]
     rows.append([btn("➕ New command", "cx|_.new|0", "success")])
+    rows.append(ADMIN_BACK)
+    return text, rich_buttons(rows)
+
+
+def limits_summary(s: dict[str, Any]) -> str:
+    cd, dl = s.get("cooldown"), s.get("daily_limit")
+    cd_t = f"{cd:g}s" if cd is not None else f"global {SETTINGS['cooldown']:g}s"
+    dl_v = SETTINGS["daily_limit"] if dl is None else dl
+    dl_t = ("∞" if not dl_v else str(dl_v)) + ("" if dl is not None else " global")
+    return f"{cd_t} cooldown · {dl_t}/user/day"
+
+
+def _cfg_row(name: str, code: str, current: Any, options: list[tuple[str, str]]) -> list[InlineKeyboardButton]:
+    row = []
+    for label, tk in options:
+        if tk == "g":
+            sel = current is None
+        elif tk in ("on", "off"):
+            sel = current is not None and (tk == "on") == bool(current)
+        else:
+            sel = current is not None and float(current) == float(tk)
+        row.append(btn(f"{'✅ ' if sel else ''}{label}", f"cx|{name}.set_{code}_{tk}|0",
+                       "success" if sel else "primary"))
+    return row
+
+
+def render_cmd_cfg(name: str) -> tuple[str, InlineKeyboardMarkup]:
+    s = SOURCES[name]
+
+    def show(key: str, fmt) -> str:  # noqa: ANN001
+        v = s.get(key)
+        return "global" if v is None else fmt(v)
+
+    text = (
+        f"⚙️ <b>/{esc(name)} · LIMITS &amp; PRIVACY</b>\n{DIV}\n"
+        + tree([
+            f"⏱ <b>Cooldown / user</b> ▸ <code>{show('cooldown', lambda v: f'{v:g}s')}</code> <i>(global {SETTINGS['cooldown']:g}s)</i>",
+            f"📅 <b>Daily limit / user</b> ▸ <code>{show('daily_limit', lambda v: '∞' if not v else str(v))}</code> <i>(global {SETTINGS['daily_limit'] or '∞'})</i>",
+            f"🧹 <b>Auto-delete</b> ▸ <code>{show('auto_delete', fmt_dur)}</code> <i>(global {fmt_dur(SETTINGS['auto_delete'])})</i>",
+            f"🕵️ <b>No query logging</b> ▸ <code>{show('no_log', lambda v: 'ON' if v else 'off')}</code> <i>(global {'ON' if SETTINGS['no_log'] else 'off'})</i>",
+        ])
+        + "\n\n<i>Limits count per user and per command. “global” follows Settings. Admins skip daily limits.</i>"
+    )
+    rows = [
+        [btn("⏱ Cooldown per user", "noop", None)],
+        _cfg_row(name, "cd", s.get("cooldown"), [("Global", "g"), ("1s", "1"), ("3s", "3"), ("5s", "5"), ("10s", "10")]),
+        [btn("📅 Daily limit per user", "noop", None)],
+        _cfg_row(name, "dl", s.get("daily_limit"), [("Global", "g"), ("∞", "0"), ("10", "10"), ("25", "25"), ("50", "50"), ("100", "100")]),
+        [btn("🧹 Auto-delete timer", "noop", None)],
+        _cfg_row(name, "ad", s.get("auto_delete"), [("Global", "g"), ("Off", "0"), ("1m", "60"), ("2m", "120"), ("5m", "300")]),
+        [btn("🕵️ Don't keep query text in logs", "noop", None)],
+        _cfg_row(name, "nl", s.get("no_log"), [("Global", "g"), ("ON", "on"), ("off", "off")]),
+        [btn("⬅️ Back", f"cx|{name}.view|0")],
+    ]
+    return text, rich_buttons(rows)
+
+
+def render_cmd_blocklist(name: str) -> tuple[str, InlineKeyboardMarkup]:
+    entries = SOURCES[name].get("blocked") or []
+    body = "\n".join(f"🚫 <code>{esc(mask_norm(n))}</code>" for n in entries[:20]) or "<i>Nothing blocked on this command.</i>"
+    text = (
+        f"🛡 <b>/{esc(name)} · BLOCKED QUERIES</b> <i>({len(entries)})</i>\n{DIV}\n{body}\n\n"
+        "<i>These queries are refused on this command only. Phone numbers match in any format.</i>"
+    )
+    rows = [[btn(f"🗑 {mask_norm(n)}", f"cx|{name}.unb_{qtok(n)}|0", "danger")] for n in entries[:20]]
+    rows.append([btn("➕ Add", f"cx|{name}.blkadd|0", "success"), btn("🧹 Clear all", f"cx|{name}.blkclr|0", "danger")])
+    rows.append([btn("⬅️ Back", f"cx|{name}.view|0")])
+    return text, rich_buttons(rows)
+
+
+def render_blocklist() -> tuple[str, InlineKeyboardMarkup]:
+    entries = sorted(BLOCKED)
+    body = "\n".join(f"🚫 <code>{esc(mask_norm(n))}</code>" for n in entries[:25]) or "<i>No protected queries yet.</i>"
+    text = (
+        f"🛡 <b>PROTECTED QUERIES</b> <i>({len(entries)})</i>\n{DIV}\n{body}\n\n"
+        "<i>Refused on EVERY command (including /num and plain text). Phone numbers match in any format: "
+        "+91 98765 43210 = 9876543210.</i>\n"
+        "Quick add: <code>/block &lt;query&gt;</code> · remove: <code>/unblock &lt;query&gt;</code>"
+    )
+    rows = [[btn(f"🗑 {mask_norm(n)}", f"adm|unb_{qtok(n)}|0", "danger")] for n in entries[:25]]
+    rows.append([btn("➕ Add", "adm|blkadd|0", "success"), btn("🧹 Clear all", "adm|blkclr|0", "danger")])
     rows.append(ADMIN_BACK)
     return text, rich_buttons(rows)
 
@@ -2232,11 +2306,10 @@ def render_cmd_panel(name: str) -> tuple[str, InlineKeyboardMarkup]:
             f"📝 <b>Footer</b> ▸ <code>{esc(shorten(s.get('footer') or 'none', 60))}</code>",
             f"🔢 <b>Min length</b> ▸ <code>{s.get('min_len')}</code>",
             f"🔑 <b>Headers</b> ▸ <code>{headers}</code>",
-            f"🚦 <b>Daily limit / user</b> ▸ <code>{s.get('daily_limit') or 'global'}</code>",
-            f"⏳ <b>Cooldown</b> ▸ <code>{(str(s.get('cooldown')) + 's') if s.get('cooldown') else 'global'}</code>",
-            f"🚫 <b>Blocked queries</b> ▸ <code>{len(s.get('blocked') or [])}</code> (+{len(BLOCKED_QUERIES)} global)",
-            f"👤 <b>User limits</b> ▸ <code>{esc(shorten(', '.join(f'{k}={v}' for k, v in (s.get('user_limits') or {}).items()) or 'none', 80))}</code>",
+            f"⏱ <b>Limits</b> ▸ <code>{esc(limits_summary(s))}</code>",
+            f"🛡 <b>Blocked</b> ▸ <code>{len(s.get('blocked') or [])}</code>",
             f"📶 <b>Status</b> ▸ {'🟢 enabled' if s.get('enabled') else '⚪ disabled'}",
+            f"🛠 <b>Maintenance</b> ▸ {'🔴 ON' if s.get('maintenance') else 'off'}",
         ])
         + f"\n\n▶️ Usage: <code>/{name} &lt;query&gt;</code>"
     )
@@ -2247,8 +2320,10 @@ def render_cmd_panel(name: str) -> tuple[str, InlineKeyboardMarkup]:
         [btn("🎨 Button colour", f"cx|{n}.style|0"), btn("🧾 Field icons", f"cx|{n}.icons|0")],
         [btn("🙈 Hide fields", f"cx|{n}.hide|0"), btn("📝 Footer", f"cx|{n}.footer|0")],
         [btn("🔢 Min length", f"cx|{n}.minlen|0"), btn("🔑 Headers", f"cx|{n}.headers|0")],
-        [btn("🚦 Daily limit", f"cx|{n}.limit|0"), btn("⏳ Cooldown", f"cx|{n}.cooldown|0")],
-        [btn("🚫 Blocked queries", f"cx|{n}.blocked|0", "danger"), btn("👤 User limits", f"cx|{n}.ulimits|0")],
+        [btn("⚙️ Limits & privacy", f"cx|{n}.cfg|0"), btn("🛡 Blocked queries", f"cx|{n}.blk|0")],
+        [btn("🛠 Maintenance: ON" if s.get("maintenance") else "🛠 Maintenance: off", f"cx|{n}.maint|0",
+             "danger" if s.get("maintenance") else "primary"),
+         btn("💬 Maint. message", f"cx|{n}.maintmsg|0")],
         [btn("🧪 Test", f"cx|{n}.test|0", "success"),
          btn("⚪ Disable" if s.get("enabled") else "🟢 Enable", f"cx|{n}.toggle|0",
              "primary" if s.get("enabled") else "success")],
@@ -2269,16 +2344,33 @@ PROMPTS = {
     "footer": "📝 <b>Footer note</b>\nSend the text shown under every result, or <code>clear</code>.",
     "minlen": "🔢 <b>Minimum query length</b>\nSend a number from 1 to 64.",
     "headers": "🔑 <b>Request headers</b>\nSend a JSON object, e.g. <code>{\"x-api-key\": \"abc\"}</code>, or <code>clear</code>.\n<i>Stored privately and never shown. Your message is deleted instantly.</i>",
-    "limit": "🚦 <b>Daily limit per user</b>\nHow many lookups each user may run with this command per day.\nSend a number, or <code>0</code> to use the global limit.",
-    "cooldown": "⏳ <b>Cooldown</b>\nSeconds a user must wait between lookups on this command.\nSend a number, or <code>0</code> to use the global cooldown.",
-    "blocked": "🚫 <b>Blocked queries</b>\nThese queries will never be searched on this command.\nOne per line or comma-separated (numbers, emails, usernames).\nPrefix with <code>-</code> to remove, send <code>clear</code> to empty.",
-    "ulimits": "👤 <b>Per-user limits</b>\nOne per line as <code>user_id=limit</code>, e.g.\n<code>123456789=5</code>\n<code>987654321=0</code> (0 = blocked from this command)\nUse <code>user_id=off</code> to remove one, <code>clear</code> to remove all.",
     "test": "🧪 <b>Test</b>\nSend a sample query and I'll run it through this command.",
+    "gblock": "🛡 <b>Protect queries</b>\nSend phone numbers, usernames or emails to protect, one per line. Nobody can look them up on ANY command.\n<i>Your message is deleted instantly.</i>",
+    "blkadd": "🛡 <b>Block queries (this command only)</b>\nSend queries to block, one per line.\n<i>Your message is deleted instantly.</i>",
+    "maintmsg": "💬 <b>Maintenance message</b>\nSend the text users see while this command is in maintenance, or <code>clear</code>.",
 }
 
 
-def prompt_markup(name: str | None) -> InlineKeyboardMarkup:
-    return rich_buttons([[btn("✖️ Cancel", f"cx|{name or '_'}.cancel|0", "danger")]])
+def prompt_markup(name: str | None, back: str = "cancel") -> InlineKeyboardMarkup:
+    return rich_buttons([[btn("✖️ Cancel", f"cx|{name or '_'}.{back}|0", "danger")]])
+
+
+def _prompt_markup_for(st: dict[str, Any]) -> InlineKeyboardMarkup:
+    op, name = st.get("op"), st.get("cmd")
+    if op == "gblock":
+        return prompt_markup(None, "cancelg")
+    if op == "blkadd":
+        return prompt_markup(name, "blk")
+    return prompt_markup(name)
+
+
+def _back_view(st: dict[str, Any]) -> tuple[str, InlineKeyboardMarkup]:
+    op, name = st.get("op"), st.get("cmd")
+    if op == "gblock":
+        return render_blocklist()
+    if op == "blkadd" and name in SOURCES:
+        return render_cmd_blocklist(name)
+    return _panel_or_list(name)
 
 
 async def _show(context, st: dict[str, Any], text: str, markup: InlineKeyboardMarkup) -> None:
@@ -2325,7 +2417,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
 
     if text.lower() == "cancel":
         INPUT.pop(uid, None)
-        await _show(context, st, *_panel_or_list(name))
+        await _show(context, st, *_back_view(st))
         return True
 
     err: str | None = None
@@ -2353,10 +2445,24 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
             await _show(context, st, f"✅ <b>/{name} created.</b> Customise it below.\n\n" + render_cmd_panel(name)[0],
                         render_cmd_panel(name)[1])
             return True
+    elif op == "gblock":
+        norms = parse_block_input(text)
+        if not norms:
+            err = "Send at least one query (3+ characters), one per line."
+        else:
+            BLOCKED.update(norms)
     elif src is None:
         INPUT.pop(uid, None)
         await _show(context, st, *render_cmd_list())
         return True
+    elif op == "blkadd":
+        norms = parse_block_input(text)
+        if not norms:
+            err = "Send at least one query (3+ characters), one per line."
+        else:
+            src["blocked"] = list(dict.fromkeys((src.get("blocked") or []) + norms))[:500]
+    elif op == "maintmsg":
+        src["maint_msg"] = "" if text.lower() == "clear" else shorten(text, 200)
     elif op == "title":
         src["title"] = shorten(text, 40) or src["title"]
     elif op == "emoji":
@@ -2398,41 +2504,6 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
             src["min_len"] = int(text)
         else:
             err = "Send a number from 1 to 64."
-    elif op in {"limit", "cooldown"}:
-        if text.isdigit() and 0 <= int(text) <= 100000:
-            src["daily_limit" if op == "limit" else "cooldown"] = int(text)
-        else:
-            err = "Send a whole number (0 = use global)."
-    elif op == "blocked":
-        if text.lower() == "clear":
-            src["blocked"] = []
-        else:
-            cur = set(src.get("blocked") or [])
-            for part in re.split(r"[,\n]+", text):
-                part = part.strip()
-                if part.startswith("-") and len(part) > 1 and not part[1:].strip().isdigit():
-                    cur.discard(norm_query(part[1:]))
-                elif part.startswith("- "):
-                    cur.discard(norm_query(part[2:]))
-                elif part:
-                    cur.add(norm_query(part))
-            src["blocked"] = sorted(x for x in cur if x)[:500]
-    elif op == "ulimits":
-        ul = {} if text.lower() == "clear" else dict(src.get("user_limits") or {})
-        if text.lower() != "clear":
-            ok = False
-            for part in re.split(r"[,\n]+", text):
-                if "=" in part:
-                    k, v = (x.strip() for x in part.split("=", 1))
-                    if k.lstrip("-").isdigit():
-                        if v.lower() == "off":
-                            ul.pop(k, None); ok = True
-                        elif v.isdigit():
-                            ul[k] = int(v); ok = True
-            if not ok:
-                err = "Use <code>user_id=limit</code>, one per line."
-        if not err:
-            src["user_limits"] = ul
     elif op == "headers":
         if text.lower() == "clear":
             src["headers"] = {}
@@ -2446,7 +2517,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
                 err = "Send a valid JSON object."
 
     if err:
-        await _show(context, st, f"⚠️ {err}\n\n" + PROMPTS.get(op, ""), prompt_markup(name))
+        await _show(context, st, f"⚠️ {err}\n\n" + PROMPTS.get(op, ""), _prompt_markup_for(st))
         return True
 
     INPUT.pop(uid, None)
@@ -2454,7 +2525,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     QUERY_CACHE.clear()
     if op in {"title", "emoji"}:
         await refresh_commands(context.bot)
-    await _show(context, st, *_panel_or_list(name))
+    await _show(context, st, *_back_view(st))
     return True
 
 
@@ -2462,6 +2533,7 @@ async def handle_cx(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str
     query = update.callback_query
     uid = query.from_user.id
     name, _, op = key.partition(".")
+    INPUT.pop(uid, None)  # leaving any pending prompt; prompt branches below set it again
 
     if op == "list":
         INPUT.pop(uid, None)
@@ -2480,6 +2552,11 @@ async def handle_cx(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str
         await _safe_edit(query, *_panel_or_list(name))
         return
 
+    if op == "cancelg":
+        await query.answer("Cancelled")
+        await _safe_edit(query, *render_blocklist())
+        return
+
     src = SOURCES.get(name)
     if not src:
         await query.answer("That command no longer exists.", show_alert=True)
@@ -2490,11 +2567,51 @@ async def handle_cx(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str
         INPUT.pop(uid, None)
         await query.answer()
         await _safe_edit(query, *render_cmd_panel(name))
+    elif op == "maint":
+        src["maintenance"] = not src.get("maintenance", False)
+        persist()
+        await refresh_commands(context.bot)
+        await query.answer("🛠 Maintenance ON" if src["maintenance"] else "✅ Back online")
+        await _safe_edit(query, *render_cmd_panel(name))
+    elif op == "cfg":
+        await query.answer()
+        await _safe_edit(query, *render_cmd_cfg(name))
+    elif op.startswith("set_"):
+        _, code, val = op.split("_", 2)
+        field = {"cd": "cooldown", "dl": "daily_limit", "ad": "auto_delete", "nl": "no_log"}.get(code)
+        if not field:
+            await query.answer("Unknown setting.")
+            return
+        if val == "g":
+            src[field] = None
+        elif field == "no_log":
+            src[field] = val == "on"
+        elif field == "cooldown":
+            src[field] = float(val)
+        else:
+            src[field] = int(val)
+        persist()
+        await query.answer("Saved ✅")
+        await _safe_edit(query, *render_cmd_cfg(name))
+    elif op == "blk":
+        await query.answer()
+        await _safe_edit(query, *render_cmd_blocklist(name))
+    elif op == "blkclr":
+        src["blocked"] = []
+        persist()
+        await query.answer("Cleared")
+        await _safe_edit(query, *render_cmd_blocklist(name))
+    elif op.startswith("unb_"):
+        tk = op[4:]
+        src["blocked"] = [n for n in (src.get("blocked") or []) if qtok(n) != tk]
+        persist()
+        await query.answer("Unblocked ✅")
+        await _safe_edit(query, *render_cmd_blocklist(name))
     elif op in PROMPTS:
         await query.answer()
         INPUT[uid] = {"op": op, "cmd": name, "chat": query.message.chat_id,
                       "mid": query.message.message_id, "ts": time.time()}
-        await _safe_edit(query, PROMPTS[op], prompt_markup(name))
+        await _safe_edit(query, PROMPTS[op], prompt_markup(name, "blk" if op == "blkadd" else "cancel"))
     elif op == "style":
         src["style"] = STYLE_CYCLE[(STYLE_CYCLE.index(src.get("style", "primary")) + 1) % len(STYLE_CYCLE)] \
             if src.get("style") in STYLE_CYCLE else "primary"
@@ -2590,6 +2707,54 @@ async def cmd_cancel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_html("✖️ Cancelled.")
 
 
+async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = uid_of(update)
+    if not is_admin(uid):
+        return
+    raw = " ".join(context.args or []).strip()
+    norms = parse_block_input(raw)
+    if not norms:
+        await update.effective_message.reply_html(
+            "Usage: <code>/block &lt;phone / username / email&gt;</code>\n"
+            "Protected queries are refused on <b>every</b> command."
+        )
+        return
+    BLOCKED.update(norms)
+    persist()
+    QUERY_CACHE.clear()
+    try:
+        await update.effective_message.delete()  # keep the protected value out of the chat
+    except TelegramError:
+        pass
+    sent = await context.bot.send_message(
+        uid, f"🛡 <b>Protected</b> ▸ <code>{esc(mask_norm(norms[0]))}</code>\n"
+        f"<i>{len(BLOCKED)} protected quer{'y' if len(BLOCKED) == 1 else 'ies'} in total.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+    autodelete(context.bot, sent, delay=60)
+
+
+async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = uid_of(update)
+    if not is_admin(uid):
+        return
+    norms = parse_block_input(" ".join(context.args or []))
+    if not norms:
+        await update.effective_message.reply_html("Usage: <code>/unblock &lt;query&gt;</code>")
+        return
+    removed = sum(1 for n in norms if n in BLOCKED)
+    BLOCKED.difference_update(norms)
+    persist()
+    try:
+        await update.effective_message.delete()
+    except TelegramError:
+        pass
+    sent = await context.bot.send_message(
+        uid, "✅ <b>Unprotected.</b>" if removed else "That query wasn't protected.", parse_mode=ParseMode.HTML
+    )
+    autodelete(context.bot, sent, delay=60)
+
+
 # --------------------------------------------------------------------------- #
 # Callbacks                                                                    #
 # --------------------------------------------------------------------------- #
@@ -2620,7 +2785,6 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if action == "adm":
         if key == "ping":
-            await query.answer("Testing source…")
             _, info = await ping_source()
             await query.answer(info[:190], show_alert=True)
             return
@@ -2647,6 +2811,28 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             )
             autodelete(context.bot, sent, delay=120)
             return
+        elif key == "dbping":
+            _, info = await STORE.ping() if STORE else (False, "No storage initialised")
+            await query.answer(info[:190], show_alert=True)
+            return
+        elif key == "blkadd":
+            await query.answer()
+            INPUT[user_id] = {"op": "gblock", "cmd": None, "chat": query.message.chat_id,
+                              "mid": query.message.message_id, "ts": time.time()}
+            await _safe_edit(query, PROMPTS["gblock"], prompt_markup(None, "cancelg"))
+            return
+        elif key == "blkclr":
+            BLOCKED.clear()
+            persist()
+            await query.answer("Cleared")
+            key = "blocklist"
+        elif key.startswith("unb_"):
+            tk = key[4:]
+            for n in [n for n in BLOCKED if qtok(n) == tk]:
+                BLOCKED.discard(n)
+            persist()
+            await query.answer("Unblocked ✅")
+            key = "blocklist"
         else:
             await query.answer()
 
@@ -2660,6 +2846,8 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             text, markup = render_top_users()
         elif key == "banned":
             text, markup = render_banned()
+        elif key == "blocklist":
+            text, markup = render_blocklist()
         else:
             text, markup = render_admin()
         await _safe_edit(query, text, markup)
@@ -2689,7 +2877,6 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if action == "lg":
         gid = int(key)
         PENDING.pop(gid, None)
-        save_groups()
         revoke_group(gid)
         try:
             await context.bot.leave_chat(gid)
@@ -2711,7 +2898,6 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if action == "ap":
             if await bot_status_in(context.bot, gid) is None:
                 PENDING.pop(gid, None)
-                save_groups()
                 await query.answer("The bot is no longer in that group.", show_alert=True)
                 await _safe_edit(query, f"⚪ <b>{esc(title)}</b> - the bot is no longer in this group.", done)
                 return
@@ -2731,7 +2917,6 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 pass
         else:
             PENDING.pop(gid, None)
-            save_groups()
             revoke_group(gid)
             try:
                 await context.bot.leave_chat(gid)
@@ -2824,6 +3009,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if action in {"x", "f"}:
         record = min(index, len(result.items) - 1)
+        pp = profile(META.get(key, {}).get("src"))
         payload = export_payload(result, None if action == "x" else record)
         blob = json.dumps(payload, indent=2, ensure_ascii=False, default=str).encode("utf-8")
         safe = re.sub(r"[^a-zA-Z0-9_-]+", "_", result.query)[:40] or "lookup"
@@ -2836,11 +3022,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "📥 <b>EXPORT READY</b>\n"
                 f"🎯 <code>{esc(shorten(result.query, 50))}</code>\n"
                 f"📦 {'Full result set · ' + str(len(result.items)) + ' records' if action == 'x' else 'Record ' + str(record + 1)}"
-                + delete_note()
+                + delete_note(eff(pp, 'auto_delete'))
             ),
             parse_mode=ParseMode.HTML,
         )
-        autodelete(context.bot, sent)
+        autodelete(context.bot, sent, delay=eff(pp, 'auto_delete'))
         return
 
     if action == "p":
@@ -2872,6 +3058,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(app: Application) -> None:
     bot = app.bot
+    await init_storage()
     await refresh_commands(bot)
 
     app.bot_data["sweeper"] = asyncio.create_task(pending_sweeper(bot))
@@ -2886,8 +3073,11 @@ async def post_init(app: Application) -> None:
         + block_table([
             ("🔌 Source", "connected" if RUNTIME["api_url"] else "NOT connected"),
             ("🛡 Groups", str(len(ALLOWED_GROUPS))),
+            ("🧩 Custom commands", str(len(SOURCES))),
+            ("💾 Storage", storage_label()),
             ("🧹 Auto-delete", fmt_dur(SETTINGS["auto_delete"])),
-        ]),
+        ])
+        + (f"\n\n⚠️ <b>{esc(STORAGE['note'])}</b>\n<i>Groups and commands will NOT survive a redeploy until this is fixed.</i>" if STORAGE["note"] else ""),
     )
 
 
@@ -2895,13 +3085,13 @@ async def post_shutdown(app: Application) -> None:
     task = app.bot_data.get("sweeper")
     if task:
         task.cancel()
+    if STORE is not None:
+        await STORE.close()
     if _SESSION and not _SESSION.closed:
         await _SESSION.close()
 
 
 def main() -> None:
-    load_groups()
-    load_state()
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -2940,10 +3130,8 @@ def main() -> None:
     app.add_handler(CommandHandler("cmds", cmd_cmds, filters=private))
     app.add_handler(CommandHandler("delcmd", cmd_delcmd, filters=private))
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=private))
-    app.add_handler(CommandHandler("block", cmd_block))        # admin-checked
-    app.add_handler(CommandHandler("unblock", cmd_unblock))
-    app.add_handler(CommandHandler("blocked", cmd_blocked, filters=private))
-    app.add_handler(CommandHandler("setlimit", cmd_setlimit))
+    app.add_handler(CommandHandler("block", cmd_block, filters=private))
+    app.add_handler(CommandHandler("unblock", cmd_unblock, filters=private))
     app.add_handler(MessageHandler(filters.COMMAND, on_custom_command))  # owner-defined commands (/tg ...)
 
     app.add_handler(CallbackQueryHandler(on_callback))
