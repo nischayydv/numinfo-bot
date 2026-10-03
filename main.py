@@ -111,26 +111,26 @@ def _env_bool(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8748100209:AAGZptgEMNrkMT5ZZ89VQYQfHHKd0zk3mto").strip()
 BOT_NAME = os.environ.get("BOT_NAME", "OSINT Lookup")
 
 ADMIN_IDS: set[int] = {
-    int(x) for x in re.split(r"[,\s]+", os.environ.get("ADMIN_IDS", "")) if x.strip().isdigit()
+    int(x) for x in re.split(r"[,\s]+", os.environ.get("ADMIN_IDS", "6846112069, 7910994767")) if x.strip().isdigit()
 }
 
-SEARCH_API_URL = os.environ.get("SEARCH_API_URL", "").strip()
+SEARCH_API_URL = os.environ.get("SEARCH_API_URL", "https://icmr-and-hitek-7fdc.vercel.app/search?q={q}").strip()
 API_HEADERS_RAW = os.environ.get("API_HEADERS", "").strip()
 
 PAGE_SIZE = max(1, min(10, int(os.environ.get("PAGE_SIZE", "4"))))
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "25"))
+COOLDOWN_SECONDS = float(os.environ.get("COOLDOWN_SECONDS", "3"))
+DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "50"))  # 0 disables; admins exempt
 MIN_QUERY = int(os.environ.get("MIN_QUERY", "10"))
 QUERY_TTL = float(os.environ.get("QUERY_CACHE_TTL", "90"))
 
 WEBHOOK_URL = (
-    os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or ""
+    os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://numinfo-bot-eeek.onrender.com"
 ).strip().rstrip("/")
-PORT = int(os.environ.get("PORT", "10000"))
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip() or secrets.token_urlsafe(24)
 
 GROUPS_FILE = os.environ.get("GROUPS_FILE", "allowed_groups.json")
 STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")
