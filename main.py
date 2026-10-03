@@ -132,6 +132,10 @@ WEBHOOK_URL = (
     os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://numinfo-bot-eeek.onrender.com"
 ).strip().rstrip("/")
 
+# --- ADD THIS ---
+PORT = int(os.environ.get("PORT", "8080"))
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip() or None
+
 GROUPS_FILE = os.environ.get("GROUPS_FILE", "allowed_groups.json")
 STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
