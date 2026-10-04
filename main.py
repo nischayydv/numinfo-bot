@@ -32,6 +32,20 @@ Set MONGODB_URI (and optionally MONGODB_DB) and the bot keeps groups, approvals,
 settings, bans, protected queries and per-user usage counters in MongoDB. Without it (or if the
 database is unreachable) it falls back to local JSON files.
 
+Reliability & safety
+--------------------
+Circuit breaker (auto-pauses a failing API and alerts admins), backup-API failover, timed
+maintenance, abuse guard (strikes -> automatic temporary ban), temp bans with reasons, per-user
+limit overrides, per-group mute / daily cap / command allow-list, persistent audit log (TTL),
+daily digest, /broadcast to groups, /backup export, user opt-out requests (/optout).
+
+Manual values & grants
+----------------------
+Every limit (cooldown, daily limit, auto-delete, cache, maintenance) has presets AND a '✏️ Custom'
+button, per command and globally. /grant gives any person unlimited or a custom daily limit on one
+command or all of them (optionally for a limited time); /revoke, /grants and a guided builder in the
+Control center manage them.
+
 Per-command control
 -------------------
 Every custom command has its own cooldown, per-user daily limit, auto-delete timer, no-logging
@@ -136,6 +150,8 @@ GROUPS_FILE = os.environ.get("GROUPS_FILE", "allowed_groups.json")
 STATE_FILE = os.environ.get("STATE_FILE", "bot_state.json")
 MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
 MONGODB_DB = os.environ.get("MONGODB_DB", "osint_bot").strip() or "osint_bot"
+AUDIT_DAYS = int(os.environ.get("AUDIT_DAYS", "30"))
+DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR_UTC", "0"))
 SEED_GROUPS = os.environ.get("ALLOWED_GROUPS", "")
 SILENT_DENY = _env_bool("SILENT_DENY")
 AUTO_APPROVE_ADMIN_ADDS = _env_bool("AUTO_APPROVE_ADMIN_ADDS", "1")
@@ -154,6 +170,9 @@ SETTINGS: dict[str, Any] = {
     "group_raw": _env_bool("GROUP_RAW"),
     "mask": True,
     "no_log": _env_bool("NO_LOG"),  # never keep query text in logs / history
+    "abuse_guard": True, "strike_limit": 8, "ban_minutes": 60,   # auto temp-ban after N strikes / 10 min
+    "breaker_fails": 5, "breaker_minutes": 5,                    # circuit breaker
+    "audit": True, "digest": True,
     "cooldown": float(os.environ.get("COOLDOWN_SECONDS", "3")),
     "daily_limit": int(os.environ.get("DAILY_LIMIT", "50")),  # 0 = unlimited (admins exempt)
 }
@@ -238,6 +257,17 @@ SOURCES: dict[str, dict[str, Any]] = {}  # owner-defined custom commands
 BLOCKED: set[str] = set()                # protected queries (normalised) - refused on every command
 STORE: Any = None
 STORAGE: dict[str, Any] = {"kind": "files", "errors": 0, "note": ""}
+BAN_INFO: dict[int, dict[str, Any]] = {}      # uid -> {until, reason, by}   (until 0 = permanent)
+USER_LIMITS: dict[int, int] = {}              # uid -> daily limit override for ALL commands (0 = unlimited)
+SRC_STATS: dict[str, dict[str, int]] = {}     # command ("-" = default) -> n / hits / err / lat
+BREAKER: dict[str, dict[str, Any]] = {}       # command -> {fails, until, alerted}
+STRIKES: dict[int, deque] = {}                # uid -> timestamps of recent violations
+OPTOUTS: dict[str, dict[str, Any]] = {}       # pending opt-out requests
+OPTOUT_COUNT: dict[tuple[int, str], int] = {}
+BROADCAST: dict[int, str] = {}
+GRANTS: dict[tuple[int, str], dict[str, Any]] = {}   # (user, command | '-' default | '*' all) -> {limit, until, by}
+GRANT_DRAFT: dict[int, dict[str, Any]] = {}          # admin id -> grant being built in the UI
+DIGEST: dict[str, Any] = {"day": today_utc(), "base": {"searches": 0, "hits": 0, "errors": 0, "users": 0, "src": {}}}
 INPUT: dict[int, dict[str, Any]] = {}    # admin id -> pending text-input state
 INPUT_TTL = 300
 
@@ -245,6 +275,7 @@ RESERVED = {
     "start", "menu", "help", "search", "recent", "usage", "emojiid", "admin", "connect", "source",
     "groups", "denygroup", "allowgroup", "banned", "ban", "unban", "num", "addcmd", "cmds",
     "delcmd", "cancel", "block", "unblock",
+    "setlimit", "limits", "broadcast", "backup", "audit", "optout", "grant", "revoke", "grants",
 }
 CMD_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 STYLE_CYCLE = ["primary", "success", "danger", "default"]
@@ -253,7 +284,8 @@ SOURCE_DEFAULTS: dict[str, Any] = {
     "icons": {}, "hide": [], "footer": "", "min_len": MIN_QUERY, "headers": {}, "enabled": True,
     # per-command overrides: None = follow the global setting
     "cooldown": None, "daily_limit": None, "auto_delete": None, "no_log": None, "blocked": [],
-    "maintenance": False, "maint_msg": "",
+    "maintenance": False, "maint_msg": "", "maint_until": 0.0,
+    "backup_url": "", "cache_ttl": None,
 }
 DEFAULT_PROFILE: dict[str, Any] = {
     "emoji": "🛰", "emoji_id": None, "title": "Lookup", "style": "primary",
@@ -297,6 +329,25 @@ def eff(p: dict[str, Any], key: str) -> Any:
     """Effective setting: the command's own value, or the global one when left on 'global'."""
     v = p.get(key)
     return SETTINGS[key] if v is None else v
+
+
+def find_grant(uid: int, name: str | None) -> dict[str, Any] | None:
+    """The grant that applies to this user on this command: command-specific first, then 'all commands'."""
+    now = time.time()
+    for key in ((uid, name or "-"), (uid, "*")):
+        g = GRANTS.get(key)
+        if g and not (g.get("until") and now >= g["until"]):
+            return g
+    return None
+
+
+def effective_limit(uid: int, name: str | None) -> int:
+    g = find_grant(uid, name)
+    if g is not None:
+        return int(g["limit"])
+    if uid in USER_LIMITS:
+        return USER_LIMITS[uid]
+    return int(eff(profile(name), "daily_limit"))
 
 
 def norm_query(q: str) -> str:
@@ -408,7 +459,7 @@ def quota_check(user_id: int, name: str | None = None) -> str | None:
     last = LAST_CALL.get(ukey, 0.0)
     if now - last < cooldown:
         return f"⏳ Easy there - try {label} again in {max(1, round(cooldown - (now - last)))}s."
-    limit = int(eff(p, "daily_limit"))
+    limit = effective_limit(user_id, name)
     if limit and not is_admin(user_id):
         today = today_utc()
         day, count = USAGE.get(ukey, (today, 0))
@@ -422,17 +473,36 @@ def quota_check(user_id: int, name: str | None = None) -> str | None:
     return None
 
 
+def persist_log(entry: dict[str, Any]) -> None:
+    if STORE is None or STORE.kind != "mongo" or not SETTINGS["audit"]:
+        return
+
+    async def _write() -> None:
+        try:
+            await STORE.log_event(entry)
+        except Exception as exc:  # noqa: BLE001
+            STORAGE["errors"] += 1
+            log.error("audit write failed: %s", type(exc).__name__)
+
+    try:
+        spawn(_write())
+    except RuntimeError:
+        pass
+
+
 def record_activity(user, chat, query: str, hits: int, ms: int, status: str,
                     cmd: str | None = None, hide_query: bool = False) -> None:
     uid = user.id if user else 0
     name = (user.full_name if user else "?") or "?"
     where = "DM" if chat is None or chat.type == ChatType.PRIVATE else (chat.title or str(chat.id))
-    LOG.append({"ts": time.time(), "uid": uid, "name": name, "where": where,
-                "query": "(hidden)" if hide_query else query, "hits": hits, "ms": ms,
-                "status": status, "cmd": cmd})
-    entry = USER_STATS.setdefault(uid, {"name": name, "count": 0, "last": 0.0})
-    entry.update(name=name, last=time.time())
-    entry["count"] += 1
+    entry = {"ts": time.time(), "uid": uid, "name": name, "where": where,
+             "query": "(hidden)" if hide_query else query, "hits": hits, "ms": ms,
+             "status": status, "cmd": cmd}
+    LOG.append(entry)
+    persist_log(entry)
+    stat = USER_STATS.setdefault(uid, {"name": name, "count": 0, "last": 0.0})
+    stat.update(name=name, last=time.time())
+    stat["count"] += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -460,9 +530,11 @@ def snapshot() -> dict[str, Any]:
     return {
         "groups": {int(k): dict(v) for k, v in ALLOWED_GROUPS.items()},
         "settings": dict(SETTINGS),
-        "banned": sorted(BANNED),
+        "banned": [{"uid": u, **(BAN_INFO.get(u) or {})} for u in sorted(BANNED)],
         "sources": json.loads(json.dumps(SOURCES)),
         "blocked": sorted(BLOCKED),
+        "limits": {int(k): int(v) for k, v in USER_LIMITS.items()},
+        "grants": [{"uid": u, "cmd": c, **g} for (u, c), g in GRANTS.items()],
     }
 
 
@@ -475,7 +547,28 @@ def apply_loaded(data: dict[str, Any]) -> None:
                 SETTINGS[key] = bool(value) if isinstance(current, bool) else type(current)(value)
             except (TypeError, ValueError):
                 pass
-    BANNED.update(int(x) for x in data.get("banned", []) if str(x).lstrip("-").isdigit())
+    for item in data.get("banned", []):
+        try:
+            if isinstance(item, dict):
+                uid = int(item["uid"])
+                BANNED.add(uid)
+                BAN_INFO[uid] = {"until": float(item.get("until") or 0), "reason": str(item.get("reason") or ""),
+                                 "by": int(item.get("by") or 0)}
+            else:
+                BANNED.add(int(item))
+        except (KeyError, TypeError, ValueError):
+            pass
+    for k, v in (data.get("limits") or {}).items():
+        try:
+            USER_LIMITS[int(k)] = int(v)
+        except (TypeError, ValueError):
+            pass
+    for item in data.get("grants", []):
+        try:
+            GRANTS[(int(item["uid"]), str(item["cmd"]))] = {
+                "limit": int(item.get("limit", 0)), "until": float(item.get("until") or 0), "by": int(item.get("by") or 0)}
+        except (KeyError, TypeError, ValueError):
+            pass
     BLOCKED.update(str(x) for x in data.get("blocked", []))
     for name, conf in (data.get("sources") or {}).items():
         if CMD_RE.match(str(name)) and isinstance(conf, dict) and conf.get("url"):
@@ -498,7 +591,7 @@ class FileStore:
         return None
 
     async def load(self) -> dict[str, Any]:
-        data: dict[str, Any] = {"groups": {}, "settings": {}, "banned": [], "sources": {}, "blocked": [], "usage": []}
+        data: dict[str, Any] = {"groups": {}, "settings": {}, "banned": [], "sources": {}, "blocked": [], "limits": {}, "grants": [], "usage": []}
         try:
             with open(GROUPS_FILE, encoding="utf-8") as fh:
                 data["groups"] = json.load(fh)
@@ -509,7 +602,7 @@ class FileStore:
         try:
             with open(STATE_FILE, encoding="utf-8") as fh:
                 state = json.load(fh)
-            for k in ("settings", "banned", "sources", "blocked"):
+            for k in ("settings", "banned", "sources", "blocked", "limits", "grants"):
                 data[k] = state.get(k, data[k])
         except FileNotFoundError:
             pass
@@ -519,13 +612,22 @@ class FileStore:
 
     def _write(self, snap: dict[str, Any]) -> None:
         _atomic_dump(GROUPS_FILE, {str(k): v for k, v in snap["groups"].items()})
-        _atomic_dump(STATE_FILE, {k: snap[k] for k in ("settings", "banned", "sources", "blocked")}, secret=True)
+        _atomic_dump(STATE_FILE, {k: snap[k] for k in ("settings", "banned", "sources", "blocked", "limits", "grants")}, secret=True)
 
     async def save(self, snap: dict[str, Any]) -> None:
         await asyncio.to_thread(self._write, snap)
 
     async def save_usage(self, *_: Any) -> None:
         return None
+
+    async def log_event(self, entry: dict[str, Any]) -> None:
+        return None
+
+    async def load_log(self, n: int = 100) -> list[dict[str, Any]]:
+        return []
+
+    async def export_log(self, since: float, limit: int = 5000) -> list[dict[str, Any]]:
+        return []
 
     async def ping(self) -> tuple[bool, str]:
         return True, "🟡 Local files (no database configured)"
@@ -551,8 +653,13 @@ class MongoStore:
         self.client = AsyncMongoClient(self.uri, serverSelectionTimeoutMS=8000)
         await self.client.admin.command("ping")
         self.db = self.client[self.dbname]
-        try:  # per-user usage counters expire on their own
-            await self.db["usage"].create_index("exp", expireAfterSeconds=0)
+        for coll in ("usage", "audit"):  # usage counters and audit entries expire on their own
+            try:
+                await self.db[coll].create_index("exp", expireAfterSeconds=0)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await self.db["audit"].create_index("ts")
         except Exception:  # noqa: BLE001
             pass
 
@@ -568,18 +675,24 @@ class MongoStore:
         source_docs = await self._all("sources")
         ban_docs = await self._all("bans")
         blocked_docs = await self._all("blocked")
+        limit_docs = await self._all("limits")
+        grant_docs = await self._all("grants")
         settings_doc = await self.db["settings"].find_one({"_id": "global"}) or {}
         usage_docs = await self._all("usage", {"day": today_utc()})
         for coll, docs in (("groups", groups_docs), ("sources", source_docs), ("bans", ban_docs),
-                           ("blocked", blocked_docs), ("settings", [settings_doc] if settings_doc else [])):
+                           ("blocked", blocked_docs), ("limits", limit_docs), ("grants", grant_docs),
+                           ("settings", [settings_doc] if settings_doc else [])):
             self._prime(coll, docs)
         strip = lambda d: {k: v for k, v in d.items() if k != "_id"}  # noqa: E731
         return {
             "groups": {int(d["_id"]): strip(d) for d in groups_docs},
             "settings": strip(settings_doc),
-            "banned": [int(d["_id"]) for d in ban_docs],
+            "banned": [{"uid": int(d["_id"]), **strip(d)} for d in ban_docs],
             "sources": {str(d["_id"]): strip(d) for d in source_docs},
             "blocked": [str(d["_id"]) for d in blocked_docs],
+            "limits": {int(d["_id"]): int(d.get("limit", 0)) for d in limit_docs},
+            "grants": [{"uid": d["uid"], "cmd": d["cmd"], "limit": d.get("limit", 0), "until": d.get("until", 0),
+                        "by": d.get("by", 0)} for d in grant_docs],
             "usage": [{"uid": d["uid"], "cmd": d["cmd"], "day": d["day"], "count": d["count"]} for d in usage_docs],
         }
 
@@ -600,8 +713,10 @@ class MongoStore:
     async def save(self, snap: dict[str, Any]) -> None:
         await self._sync("groups", [{"_id": gid, **meta} for gid, meta in snap["groups"].items()])
         await self._sync("sources", [{"_id": n, **conf} for n, conf in snap["sources"].items()])
-        await self._sync("bans", [{"_id": uid} for uid in snap["banned"]])
+        await self._sync("bans", [{"_id": b["uid"], **{k: v for k, v in b.items() if k != "uid"}} for b in snap["banned"]])
         await self._sync("blocked", [{"_id": n} for n in snap["blocked"]])
+        await self._sync("limits", [{"_id": uid, "limit": n} for uid, n in snap["limits"].items()])
+        await self._sync("grants", [{"_id": f"{g['uid']}:{g['cmd']}", **g} for g in snap["grants"]])
         await self._sync("settings", [{"_id": "global", **snap["settings"]}])
 
     async def save_usage(self, day: str, uid: int, cmd: str, count: int) -> None:
@@ -611,6 +726,21 @@ class MongoStore:
             {"$set": {"day": day, "uid": uid, "cmd": cmd, "count": count, "exp": exp}},
             upsert=True,
         )
+
+    async def log_event(self, entry: dict[str, Any]) -> None:
+        doc = dict(entry)
+        doc["exp"] = datetime.now(timezone.utc) + timedelta(days=AUDIT_DAYS)
+        await self.db["audit"].insert_one(doc)
+
+    async def load_log(self, n: int = 100) -> list[dict[str, Any]]:
+        docs = await self.db["audit"].find({}).sort("ts", -1).limit(n).to_list(length=None)
+        out = [{k: v for k, v in d.items() if k not in ("_id", "exp")} for d in docs]
+        out.reverse()
+        return out
+
+    async def export_log(self, since: float, limit: int = 5000) -> list[dict[str, Any]]:
+        docs = await self.db["audit"].find({"ts": {"$gte": since}}).sort("ts", 1).limit(limit).to_list(length=None)
+        return [{k: v for k, v in d.items() if k not in ("_id", "exp")} for d in docs]
 
     async def ping(self) -> tuple[bool, str]:
         started = time.perf_counter()
@@ -678,6 +808,10 @@ async def init_storage() -> None:
         data = await STORE.load()
     STORAGE["kind"] = STORE.kind
     apply_loaded(data)
+    try:
+        LOG.extend(await STORE.load_log(100))
+    except Exception:  # noqa: BLE001
+        pass
 
     seeded = False
     for gid in re.split(r"[,\s]+", SEED_GROUPS):
@@ -693,7 +827,8 @@ async def init_storage() -> None:
 
 
 def authorize_group(chat_id: int, title: str | None, by: int) -> None:
-    ALLOWED_GROUPS[chat_id] = {"title": title or str(chat_id), "by": by, "ts": int(time.time())}
+    ALLOWED_GROUPS[chat_id] = {**ALLOWED_GROUPS.get(chat_id, {}), "title": title or str(chat_id), "by": by,
+                               "ts": int(time.time())}  # keeps mute / cap / command settings on re-approval
     PENDING.pop(chat_id, None)
     save_groups()
 
@@ -802,7 +937,7 @@ async def access_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if chat.id in ALLOWED_GROUPS:
             if is_admin(user.id):
                 return
-            if user.id in BANNED:
+            if is_banned(user.id):
                 await _stop(update)
             if SETTINGS["members_can_search"]:
                 return
@@ -1316,7 +1451,7 @@ def render_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     icon = CUSTOM_EMOJI["search"]
     logo = tg_emoji(icon, "🕵️") if icon else "🕵️"
     src = "🟢 Source online" if RUNTIME.get("api_url") else "🔴 No source"
-    cmds = [f"<code>/{n}</code>{' 🛠' if c.get('maintenance') else ''}" for n, c in SOURCES.items() if c.get("enabled")]
+    cmds = [f"<code>/{n}</code>{' 🛠' if maint_active(c) else ''}" for n, c in SOURCES.items() if c.get("enabled")]
     cmd_line = f"🧩 <b>Commands</b> ▸ {' '.join(cmds)}\n\n" if cmds else ""
     lock = " · 🔒 Lockdown" if SETTINGS["lockdown"] else ""
     text = (
@@ -1368,13 +1503,15 @@ def render_help() -> str:
         "▪️ 📥 exports what you are viewing as JSON\n"
         f"▪️ 🧹 Results self-destruct after {fmt_dur(SETTINGS['auto_delete'])}\n\n"
         "⌨️ <b>Commands</b>\n"
-        "<code>/search</code> <code>/num</code> <code>/recent</code> <code>/usage</code> <code>/menu</code>"
+        "<code>/search</code> <code>/num</code> <code>/recent</code> <code>/usage</code> <code>/menu</code> <code>/optout</code>"
         + custom
         + "\n\n🛠 <b>Admin</b>\n"
         "<code>/admin</code> <code>/groups</code> <code>/allowgroup</code> <code>/denygroup</code>\n"
         "<code>/ban</code> <code>/unban</code> <code>/banned</code> <code>/connect</code> <code>/source</code>\n"
         "<code>/addcmd</code> <code>/cmds</code> <code>/delcmd</code>\n"
-        "<code>/block</code> <code>/unblock</code>"
+        "<code>/block</code> <code>/unblock</code> <code>/setlimit</code> <code>/limits</code>\n"
+        "<code>/broadcast</code> <code>/backup</code> <code>/audit</code>\n"
+        "<code>/grant</code> <code>/revoke</code> <code>/grants</code>"
     )
 
 
@@ -1404,11 +1541,12 @@ def render_admin() -> tuple[str, InlineKeyboardMarkup]:
             ("⚡ Avg speed", avg),
             ("⚠️ Failures", str(STATS["errors"])),
         ])
+        + cmd_stats_block()
         + "\n\n🌐 <b>REACH</b>\n"
         + block_table([
             ("👥 Users", str(len(STATS["users"]))),
             ("🛡 Groups", f"{len(ALLOWED_GROUPS)} allowed · {len(PENDING)} pending"),
-            ("🚫 Banned", str(len(BANNED))),
+            ("🚫 Banned", f"{len(BANNED)} ({sum(1 for u in BANNED if (BAN_INFO.get(u) or {}).get('until'))} temporary)"),
             ("🧩 Custom commands", str(len(SOURCES))),
             ("🛡 Protected queries", str(len(BLOCKED))),
         ])
@@ -1418,18 +1556,22 @@ def render_admin() -> tuple[str, InlineKeyboardMarkup]:
             ("🧹 Auto-delete", fmt_dur(SETTINGS["auto_delete"])),
             ("🔒 Lockdown", "ON" if SETTINGS["lockdown"] else "off"),
             ("💾 Storage", storage_label()),
-            ("🛠 In maintenance", str(sum(1 for c in SOURCES.values() if c.get("maintenance"))) + " command(s)"),
+            ("🛠 In maintenance", str(sum(1 for c in SOURCES.values() if maint_active(c))) + " command(s)"),
+            ("🧯 Breakers open", str(sum(1 for b in BREAKER.values() if b["until"] > time.time())) + " command(s)"),
             ("🗃 Cached sets", str(len(CACHE))),
             ("⏱ Uptime", uptime),
         ])
         + f"\n\n{DIV}\n<i>Last refreshed {clock()} UTC</i>"
     )
     rows = [
-        [btn("⚙️ Settings", "adm|settings|0", "primary"), btn("🛡 Groups", "adm|groups|0", "primary")],
+        [btn("⚙️ Settings", "adm|settings|0", "primary"), btn("🔐 Security", "adm|security|0", "primary")],
         [btn("🧩 Custom commands", "cx|_.list|0", "success")],
-        [btn("🛡 Protected queries", "adm|blocklist|0", "primary"), btn("💾 Test database", "adm|dbping|0", "success")],
+        [btn(f"🎁 Grants ({len(GRANTS)})", "gr|list|0", "success"), btn("➕ New grant", "gr|new|0", "success")],
+        [btn("🛡 Groups", "adm|groups|0", "primary"), btn("🛡 Protected queries", "adm|blocklist|0", "primary")],
         [btn("📜 Activity log", "adm|activity|0", "primary"), btn("🏆 Top users", "adm|users|0", "primary")],
-        [btn("🚫 Ban list", "adm|banned|0", "primary"), btn("🩺 Test source", "adm|ping|0", "success")],
+        [btn("🚫 Ban list", "adm|banned|0", "primary"), btn(f"📬 Opt-outs ({len(OPTOUTS)})", "adm|optouts|0", "primary")],
+        [btn("🩺 Test source", "adm|ping|0", "success"), btn("💾 Test database", "adm|dbping|0", "success")],
+        [btn("📰 Digest now", "adm|digest|0", "primary"), btn("💾 Backup", "adm|backup|0", "primary")],
         [btn("🧹 Clear cache", "adm|clear|0", "danger"), btn("📤 Export log", "adm|log|0", "success")],
         [btn("🔄 Refresh", "adm|home|0", "primary"), btn("🏠 Menu", "menu|0|0", "primary")],
     ]
@@ -1439,7 +1581,10 @@ def render_admin() -> tuple[str, InlineKeyboardMarkup]:
 SETTING_KEYS = {
     "ad": "auto_delete", "dq": "delete_queries", "lock": "lockdown", "mem": "members_can_search",
     "raw": "group_raw", "mask": "mask", "cd": "cooldown", "dl": "daily_limit", "nl": "no_log",
+    "ag": "abuse_guard", "au": "audit", "dg": "digest", "sl": "strike_limit", "bm": "ban_minutes",
+    "bf": "breaker_fails", "bk": "breaker_minutes",
 }
+SECURITY_KEYS = {"ag", "au", "dg", "sl", "bm", "bf", "bk"}
 
 
 def _opt_row(code: str, current: float, options: list[tuple[str, float]]) -> list[InlineKeyboardButton]:
@@ -1475,11 +1620,11 @@ def render_settings() -> tuple[str, InlineKeyboardMarkup]:
         + "\n\n<i>Changes apply instantly and are saved.</i>"
     )
     rows = [
-        [btn("🧹 Auto-delete timer", "noop", None)],
+        [btn("🧹 Auto-delete timer", "noop", None), btn("✏️ Custom", "adm|val_ad|0", "success")],
         _opt_row("ad", s["auto_delete"], [("Off", 0), ("1m", 60), ("2m", 120), ("5m", 300)]),
-        [btn("⏱ Cooldown per user", "noop", None)],
+        [btn("⏱ Cooldown per user", "noop", None), btn("✏️ Custom", "adm|val_cd|0", "success")],
         _opt_row("cd", s["cooldown"], [("1s", 1), ("3s", 3), ("5s", 5), ("10s", 10)]),
-        [btn("📅 Daily limit per user", "noop", None)],
+        [btn("📅 Daily limit per user", "noop", None), btn("✏️ Custom", "adm|val_dl|0", "success")],
         _opt_row("dl", s["daily_limit"], [("∞", 0), ("25", 25), ("50", 50), ("100", 100), ("200", 200)]),
         [_toggle("dq", "Delete queries", s["delete_queries"]), _toggle("mask", "Masking", s["mask"])],
         [_toggle("nl", "Don't log queries", s["no_log"])],
@@ -1501,8 +1646,15 @@ async def render_groups_view(bot) -> tuple[str, InlineKeyboardMarkup]:
             ok += 1
             mark = "✅"
             note = "working · admin" if status == ChatMemberStatus.ADMINISTRATOR else "working"
+        if meta.get("muted"):
+            note += " · 🔇 muted"
+        if meta.get("cap"):
+            note += f" · cap {meta['cap']}/day"
+        if meta.get("cmds") is not None:
+            note += " · restricted"
         lines.append(f"{mark} <b>{esc(meta.get('title', gid))}</b>\n   <code>{gid}</code> · {note}")
-        rows.append([btn(f"🚪 Leave · {shorten(meta.get('title', gid), 20)}", f"lg|{gid}|0", "danger")])
+        rows.append([btn(f"⚙️ {shorten(meta.get('title', gid), 16)}", f"adm|gv_{gid}|0", "primary"),
+                     btn("🚪 Leave", f"lg|{gid}|0", "danger")])
 
     text = (
         f"🛡 <b>GROUP MANAGER</b>\n{DIV}\n"
@@ -1554,14 +1706,23 @@ def render_top_users() -> tuple[str, InlineKeyboardMarkup]:
 
 
 def render_banned() -> tuple[str, InlineKeyboardMarkup]:
-    ids = sorted(BANNED)[:15]
+    now = time.time()
+    ids = [u for u in sorted(BANNED) if is_banned(u)][:15]
     if not ids:
-        body = "<i>Nobody is banned.</i>\n\nBan someone with <code>/ban &lt;user_id&gt;</code> or by replying to their message with <code>/ban</code>."
+        body = ("<i>Nobody is banned.</i>\n\nBan with <code>/ban &lt;user_id&gt; [duration] [reason]</code> "
+                "or reply to a message with <code>/ban</code>.")
     else:
-        body = "\n".join(f"🚫 <code>{uid}</code> · {esc(USER_STATS.get(uid, {}).get('name', 'unknown'))}" for uid in ids)
+        lines = []
+        for uid in ids:
+            info = BAN_INFO.get(uid) or {}
+            until = info.get("until") or 0
+            when = f"⏱ {fmt_left(until - now)} left" if until else "♾ permanent"
+            why = f" · {esc(info['reason'])}" if info.get("reason") else ""
+            lines.append(f"🚫 <code>{uid}</code> · {esc(USER_STATS.get(uid, {}).get('name', 'unknown'))}\n   {when}{why}")
+        body = "\n".join(lines)
     rows = [[btn(f"✅ Unban {uid}", f"ub|{uid}|0", "success")] for uid in ids]
     rows.append(ADMIN_BACK)
-    return f"🚫 <b>BAN LIST</b> <i>({len(BANNED)})</i>\n{DIV}\n\n{body}", rich_buttons(rows)
+    return f"🚫 <b>BAN LIST</b> <i>({len(ids)})</i>\n{DIV}\n\n{body}", rich_buttons(rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -1616,29 +1777,39 @@ async def get_session() -> aiohttp.ClientSession:
     return _SESSION
 
 
-async def run_search(query: str, name: str | None = None) -> SearchResult:
-    base, headers = source_conf(name)
-    url = build_url(query, base)
-    started = time.perf_counter()
+async def _fetch(url: str, headers: dict[str, str], name: str | None) -> Any:
     try:
         session = await get_session()
         async with session.get(url, headers=headers) as response:
             body = await response.text()
             if response.status == 404:
-                payload: Any = {}
-            elif response.status >= 400:
+                return {}
+            if response.status >= 400:
                 log.error("source error %s (%s): %s", response.status, name or "default", body[:300])
                 raise ApiError("The intelligence source rejected that lookup. Try again shortly.")
-            else:
-                try:
-                    payload = json.loads(body)
-                except json.JSONDecodeError:
-                    payload = {"response": shorten(body, 2000)}
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError:
+                return {"response": shorten(body, 2000)}
     except asyncio.TimeoutError as exc:
         raise ApiError("The source timed out. Please try again in a moment.") from exc
     except aiohttp.ClientError as exc:
         log.error("source unreachable (%s): %s", name or "default", type(exc).__name__)
         raise ApiError("The intelligence source is unreachable right now.") from exc
+
+
+async def run_search(query: str, name: str | None = None) -> SearchResult:
+    base, headers = source_conf(name)
+    url = build_url(query, base)
+    started = time.perf_counter()
+    try:
+        payload = await _fetch(url, headers, name)
+    except ApiError:
+        backup = ((SOURCES.get(name) or {}).get("backup_url") or "") if name else ""
+        if not backup:
+            raise
+        log.warning("primary API failed for /%s - using backup", name)
+        payload = await _fetch(build_url(query, backup), headers, name)
 
     elapsed = int((time.perf_counter() - started) * 1000)
     items, meta = extract_items(payload)
@@ -1648,8 +1819,10 @@ async def run_search(query: str, name: str | None = None) -> SearchResult:
 
 async def search_cached(query: str, name: str | None = None) -> SearchResult:
     key = f"{name or '-'}|{query.strip().lower()}"
+    ttl = profile(name).get("cache_ttl")
+    ttl = QUERY_TTL if ttl is None else float(ttl)
     hit = QUERY_CACHE.get(key)
-    if hit and time.time() - hit.created_at < QUERY_TTL:
+    if ttl > 0 and hit and time.time() - hit.created_at < ttl:
         return hit
     task = INFLIGHT.get(key)
     if task is not None:
@@ -1720,11 +1893,10 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def usage_numbers(user_id: int, name: str | None = None) -> tuple[int, str]:
-    p = profile(name)
     day, count = USAGE.get((user_id, name or "-"), (today_utc(), 0))
     if day != today_utc():
         count = 0
-    limit = int(eff(p, "daily_limit"))
+    limit = effective_limit(user_id, name)
     left = "unlimited" if not limit or is_admin(user_id) else str(max(0, limit - count))
     return count, left
 
@@ -1738,7 +1910,7 @@ async def cmd_usage(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         used, left = usage_numbers(uid, n)
         lines.append(
             f"{emoji_html(p)} <b>{'/num' if n is None else '/' + n}</b> ▸ "
-            f"<code>{used}</code> used · <code>{left}</code> left · ⏱ <code>{float(eff(p, 'cooldown')):g}s</code>"
+            f"<code>{used}</code> used · <code>{left}</code> left · ⏱ <code>{float(eff(p, 'cooldown')):g}s</code>{' 🎁' if find_grant(uid, n) else ''}"
         )
     await update.effective_message.reply_html(f"📊 <b>YOUR USAGE</b>\n{DIV}\n" + tree(lines))
 
@@ -1767,6 +1939,8 @@ async def do_search(update: Update, query: str, force_cards: bool = False,
     min_len = int(p.get("min_len") or MIN_QUERY)
     delay = eff(p, "auto_delete")
     nolog = bool(eff(p, "no_log"))
+    admin = is_admin(user_id)
+    gmeta = ALLOWED_GROUPS.get(chat.id) if group else None
 
     def clean(*msgs) -> None:
         if delay:
@@ -1774,13 +1948,30 @@ async def do_search(update: Update, query: str, force_cards: bool = False,
             if SETTINGS["delete_queries"] and update.message is not None:
                 autodelete(bot, update.message, delay=delay)
 
-    if SETTINGS["lockdown"] and not is_admin(user_id):
+    if SETTINGS["lockdown"] and not admin:
         await message.reply_html("🛠 <b>Maintenance</b>\nLookups are paused for a moment. Please try again soon.")
         return
-    if source and p.get("maintenance") and not is_admin(user_id):
+    if gmeta is not None and not admin:  # per-group controls
+        if gmeta.get("muted"):
+            return
+        if not group_allows(chat.id, source):
+            note = await message.reply_html(
+                f"🚫 <b>/{esc(source or 'num')}</b> is disabled in this group." + delete_note(delay)
+            )
+            clean(note)
+            return
+    if source and maint_active(p) and not admin:
         note = await message.reply_html(
             f"🛠 <b>/{esc(source)} is under maintenance</b>\n"
             f"{esc(p.get('maint_msg') or 'It will be back shortly.')}" + delete_note(delay)
+        )
+        clean(note)
+        return
+    bk = BREAKER.get(source or "-")
+    if bk and bk["until"] > time.time() and not admin:  # circuit breaker is open
+        note = await message.reply_html(
+            "🧯 <b>Temporarily unavailable</b>\nThe data source is being protected after repeated errors. "
+            f"Please try again in {fmt_left(bk['until'] - time.time())}." + delete_note(delay)
         )
         clean(note)
         return
@@ -1793,11 +1984,29 @@ async def do_search(update: Update, query: str, force_cards: bool = False,
         )
         clean(note)
         record_activity(user, chat, query, 0, 0, "blocked", source, hide_query=True)
+        await strike(bot, user, "protected query", 3)
         return
+
+    cap = int((gmeta or {}).get("cap") or 0) if not admin else 0
+    gday, gcount = today_utc(), 0
+    if cap:
+        gday, gcount = USAGE.get((chat.id, "__grp"), (today_utc(), 0))
+        if gday != today_utc():
+            gday, gcount = today_utc(), 0
+        if gcount >= cap:
+            note = await message.reply_html(
+                f"🚦 This group reached its daily limit ({cap} lookups). Resets at midnight UTC."
+            )
+            clean(note)
+            return
     blocked = quota_check(user_id, source)
     if blocked:
         await message.reply_html(blocked)
+        await strike(bot, user, "rate limit", 1)
         return
+    if cap:
+        USAGE[(chat.id, "__grp")] = (gday, gcount + 1)
+        persist_usage(gday, chat.id, "__grp", gcount + 1)
 
     STATS["users"].add(user_id)
     try:
@@ -1822,19 +2031,24 @@ async def do_search(update: Update, query: str, force_cards: bool = False,
         return
     except ApiError as exc:
         STATS["errors"] += 1
+        src_stat(source, err=True)
         record_activity(user, chat, query, 0, int((time.perf_counter() - started) * 1000), "error", source, nolog)
         await placeholder.edit_text(f"⚠️ {esc(exc)}", parse_mode=ParseMode.HTML)
+        await breaker_fail(bot, source)
         return
     except Exception:  # noqa: BLE001
         STATS["errors"] += 1
+        src_stat(source, err=True)
         log.exception("lookup failed")
         record_activity(user, chat, query, 0, 0, "error", source, nolog)
         await placeholder.edit_text("💥 Something went wrong on our side. Please try again.")
         return
 
+    BREAKER.pop(source or "-", None)  # a healthy answer closes the breaker
     STATS["searches"] += 1
     STATS["lat_total"] += result.elapsed_ms
     STATS["lat_n"] += 1
+    src_stat(source, hits=len(result.items), ms=result.elapsed_ms)
     if source is None and not nolog:
         remember(user_id, query)
     record_activity(user, chat, query, len(result.items), result.elapsed_ms, "ok", source, nolog)
@@ -2022,24 +2236,34 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user or not is_admin(user.id):
         return
+    args = list(context.args or [])
     target = None
     reply = update.effective_message.reply_to_message
     if reply and reply.from_user:
         target = reply.from_user.id
         USER_STATS.setdefault(target, {"name": reply.from_user.full_name, "count": 0, "last": 0.0})
-    elif context.args and context.args[0].lstrip("-").isdigit():
-        target = int(context.args[0])
+    elif args and args[0].lstrip("-").isdigit():
+        target = int(args.pop(0))
     if target is None:
         await update.effective_message.reply_html(
-            "Usage: <code>/ban &lt;user_id&gt;</code> or reply to a message with <code>/ban</code>"
+            "Usage: <code>/ban &lt;user_id&gt; [duration] [reason]</code> or reply with <code>/ban [duration] [reason]</code>\n"
+            "Durations: <code>30m</code> <code>6h</code> <code>7d</code> <code>2w</code> or <code>perm</code> (default)."
         )
         return
     if is_admin(target):
         await update.effective_message.reply_html("🛡 You can't ban an admin.")
         return
-    BANNED.add(target)
-    save_state()
-    await update.effective_message.reply_html(f"🚫 <b>Banned</b> <code>{target}</code>")
+    minutes = 0
+    if args:
+        parsed = parse_duration(args[0])
+        if parsed is not None:
+            minutes = parsed
+            args.pop(0)
+    reason = " ".join(args)
+    ban_user(target, minutes, reason, user.id)
+    await update.effective_message.reply_html(
+        f"🚫 <b>Banned</b> <code>{target}</code> · {fmt_minutes(minutes)}" + (f"\n📝 {esc(reason)}" if reason else "")
+    )
 
 
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2050,8 +2274,7 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_html("Usage: <code>/unban &lt;user_id&gt;</code>")
         return
     target = int(context.args[0])
-    BANNED.discard(target)
-    save_state()
+    unban_user(target)
     await update.effective_message.reply_html(f"✅ <b>Unbanned</b> <code>{target}</code>")
 
 
@@ -2149,6 +2372,14 @@ ADMIN_COMMANDS = [
     BotCommand("delcmd", "Delete a custom command"),
     BotCommand("block", "Protect a query from lookups"),
     BotCommand("unblock", "Remove a protected query"),
+    BotCommand("setlimit", "Set a user's daily limit"),
+    BotCommand("limits", "List per-user limit overrides"),
+    BotCommand("broadcast", "Announce to all groups"),
+    BotCommand("backup", "Export a config backup"),
+    BotCommand("audit", "Export the audit log"),
+    BotCommand("grant", "Give a user unlimited / custom limits"),
+    BotCommand("revoke", "Remove a user's grants"),
+    BotCommand("grants", "List all grants"),
     BotCommand("groups", "Manage groups"),
     BotCommand("allowgroup", "Authorize a group"),
     BotCommand("denygroup", "Revoke a group"),
@@ -2167,12 +2398,13 @@ async def refresh_commands(bot) -> None:
     custom = []
     for name, src in SOURCES.items():
         if src.get("enabled"):
-            desc = shorten(f"{'🛠 ' if src.get('maintenance') else ''}{src.get('emoji') or ''} {src.get('title') or name}".strip(), 200)
+            desc = shorten(f"{'🛠 ' if maint_active(src) else ''}{src.get('emoji') or ''} {src.get('title') or name}".strip(), 200)
             custom.append(BotCommand(name, desc or name))
     custom = custom[:60]
     try:
         await bot.delete_my_commands()
-        group_cmds = [BotCommand("num", "Run an OSINT lookup")] + custom
+        group_cmds = [BotCommand("num", "Run an OSINT lookup"),
+                      BotCommand("optout", "Ask for a number/username to be protected")] + custom
         await bot.set_my_commands(group_cmds, scope=BotCommandScopeAllGroupChats())
         await bot.set_my_commands(group_cmds, scope=BotCommandScopeAllChatAdministrators())
     except TelegramError as exc:
@@ -2187,7 +2419,7 @@ async def refresh_commands(bot) -> None:
 def render_cmd_list() -> tuple[str, InlineKeyboardMarkup]:
     if SOURCES:
         lines = [
-            f"{'🛠' if s.get('maintenance') else ('🟢' if s.get('enabled') else '⚪')} {esc(s.get('emoji') or '')} <b>/{n}</b> ▸ {esc(s.get('title', n))} · <code>{esc(host_of(s['url']))}</code>"
+            f"{'🛠' if maint_active(s) else ('🟢' if s.get('enabled') else '⚪')} {esc(s.get('emoji') or '')} <b>/{n}</b> ▸ {esc(s.get('title', n))} · <code>{esc(host_of(s['url']))}</code>"
             for n, s in SOURCES.items()
         ]
         body = "\n".join(lines)
@@ -2229,6 +2461,17 @@ def _cfg_row(name: str, code: str, current: Any, options: list[tuple[str, str]])
     return row
 
 
+def _mt_row(name: str) -> list[InlineKeyboardButton]:
+    s = SOURCES[name]
+    active = maint_active(s)
+    indefinite = active and not (s.get("maint_until") or 0)
+    row = []
+    for label, secs in (("Off", 0), ("30m", 1800), ("1h", 3600), ("6h", 21600), ("∞", -1)):
+        sel = (secs == 0 and not active) or (secs == -1 and indefinite)
+        row.append(btn(f"{'✅ ' if sel else ''}{label}", f"cx|{name}.set_mt_{secs}|0", "danger" if sel and secs else ("success" if sel else "primary")))
+    return row
+
+
 def render_cmd_cfg(name: str) -> tuple[str, InlineKeyboardMarkup]:
     s = SOURCES[name]
 
@@ -2243,18 +2486,24 @@ def render_cmd_cfg(name: str) -> tuple[str, InlineKeyboardMarkup]:
             f"📅 <b>Daily limit / user</b> ▸ <code>{show('daily_limit', lambda v: '∞' if not v else str(v))}</code> <i>(global {SETTINGS['daily_limit'] or '∞'})</i>",
             f"🧹 <b>Auto-delete</b> ▸ <code>{show('auto_delete', fmt_dur)}</code> <i>(global {fmt_dur(SETTINGS['auto_delete'])})</i>",
             f"🕵️ <b>No query logging</b> ▸ <code>{show('no_log', lambda v: 'ON' if v else 'off')}</code> <i>(global {'ON' if SETTINGS['no_log'] else 'off'})</i>",
+            f"♻️ <b>Result cache</b> ▸ <code>{show('cache_ttl', lambda v: 'off' if not v else fmt_dur(v))}</code> <i>(global {fmt_dur(QUERY_TTL)})</i>",
+            f"🛠 <b>Maintenance</b> ▸ <code>{esc(maint_text(s))}</code>",
         ])
         + "\n\n<i>Limits count per user and per command. “global” follows Settings. Admins skip daily limits.</i>"
     )
     rows = [
-        [btn("⏱ Cooldown per user", "noop", None)],
+        [btn("⏱ Cooldown per user", "noop", None), btn("✏️ Custom", f"cx|{name}.val_cd|0", "success")],
         _cfg_row(name, "cd", s.get("cooldown"), [("Global", "g"), ("1s", "1"), ("3s", "3"), ("5s", "5"), ("10s", "10")]),
-        [btn("📅 Daily limit per user", "noop", None)],
+        [btn("📅 Daily limit per user", "noop", None), btn("✏️ Custom", f"cx|{name}.val_dl|0", "success")],
         _cfg_row(name, "dl", s.get("daily_limit"), [("Global", "g"), ("∞", "0"), ("10", "10"), ("25", "25"), ("50", "50"), ("100", "100")]),
-        [btn("🧹 Auto-delete timer", "noop", None)],
+        [btn("🧹 Auto-delete timer", "noop", None), btn("✏️ Custom", f"cx|{name}.val_ad|0", "success")],
         _cfg_row(name, "ad", s.get("auto_delete"), [("Global", "g"), ("Off", "0"), ("1m", "60"), ("2m", "120"), ("5m", "300")]),
         [btn("🕵️ Don't keep query text in logs", "noop", None)],
         _cfg_row(name, "nl", s.get("no_log"), [("Global", "g"), ("ON", "on"), ("off", "off")]),
+        [btn("♻️ Result cache (saves API calls)", "noop", None), btn("✏️ Custom", f"cx|{name}.val_ct|0", "success")],
+        _cfg_row(name, "ct", s.get("cache_ttl"), [("Global", "g"), ("Off", "0"), ("30s", "30"), ("5m", "300"), ("1h", "3600")]),
+        [btn("🛠 Maintenance for…", "noop", None), btn("✏️ Custom", f"cx|{name}.val_mt|0", "success")],
+        _mt_row(name),
         [btn("⬅️ Back", f"cx|{name}.view|0")],
     ]
     return text, rich_buttons(rows)
@@ -2308,8 +2557,11 @@ def render_cmd_panel(name: str) -> tuple[str, InlineKeyboardMarkup]:
             f"🔑 <b>Headers</b> ▸ <code>{headers}</code>",
             f"⏱ <b>Limits</b> ▸ <code>{esc(limits_summary(s))}</code>",
             f"🛡 <b>Blocked</b> ▸ <code>{len(s.get('blocked') or [])}</code>",
+            f"📈 <b>Stats</b> ▸ <code>{esc(src_stats_line(name))}</code>",
+            f"🛟 <b>Backup API</b> ▸ <code>{esc('set · ' + host_of(s['backup_url'])) if s.get('backup_url') else 'none'}</code>",
+            f"🧯 <b>Breaker</b> ▸ <code>{esc(breaker_text(name))}</code>",
             f"📶 <b>Status</b> ▸ {'🟢 enabled' if s.get('enabled') else '⚪ disabled'}",
-            f"🛠 <b>Maintenance</b> ▸ {'🔴 ON' if s.get('maintenance') else 'off'}",
+            f"🛠 <b>Maintenance</b> ▸ <code>{esc(maint_text(s))}</code>",
         ])
         + f"\n\n▶️ Usage: <code>/{name} &lt;query&gt;</code>"
     )
@@ -2321,9 +2573,10 @@ def render_cmd_panel(name: str) -> tuple[str, InlineKeyboardMarkup]:
         [btn("🙈 Hide fields", f"cx|{n}.hide|0"), btn("📝 Footer", f"cx|{n}.footer|0")],
         [btn("🔢 Min length", f"cx|{n}.minlen|0"), btn("🔑 Headers", f"cx|{n}.headers|0")],
         [btn("⚙️ Limits & privacy", f"cx|{n}.cfg|0"), btn("🛡 Blocked queries", f"cx|{n}.blk|0")],
-        [btn("🛠 Maintenance: ON" if s.get("maintenance") else "🛠 Maintenance: off", f"cx|{n}.maint|0",
-             "danger" if s.get("maintenance") else "primary"),
+        [btn("🛠 Maintenance: ON" if maint_active(s) else "🛠 Maintenance: off", f"cx|{n}.maint|0",
+             "danger" if maint_active(s) else "primary"),
          btn("💬 Maint. message", f"cx|{n}.maintmsg|0")],
+        [btn("🛟 Backup API", f"cx|{n}.backup|0"), btn("🧯 Reset breaker", f"cx|{n}.brk|0")],
         [btn("🧪 Test", f"cx|{n}.test|0", "success"),
          btn("⚪ Disable" if s.get("enabled") else "🟢 Enable", f"cx|{n}.toggle|0",
              "primary" if s.get("enabled") else "success")],
@@ -2348,6 +2601,7 @@ PROMPTS = {
     "gblock": "🛡 <b>Protect queries</b>\nSend phone numbers, usernames or emails to protect, one per line. Nobody can look them up on ANY command.\n<i>Your message is deleted instantly.</i>",
     "blkadd": "🛡 <b>Block queries (this command only)</b>\nSend queries to block, one per line.\n<i>Your message is deleted instantly.</i>",
     "maintmsg": "💬 <b>Maintenance message</b>\nSend the text users see while this command is in maintenance, or <code>clear</code>.",
+    "backup": "🛟 <b>Backup API</b>\nSend a backup URL (with <code>{q}</code>). It is used automatically when the main API fails. Send <code>clear</code> to remove.\n<i>Your message is deleted instantly.</i>",
 }
 
 
@@ -2361,7 +2615,20 @@ def _prompt_markup_for(st: dict[str, Any]) -> InlineKeyboardMarkup:
         return prompt_markup(None, "cancelg")
     if op == "blkadd":
         return prompt_markup(name, "blk")
+    if op == "val":
+        return prompt_markup(name, "cfg") if name else prompt_markup(None, "cancelset")
+    if op in GRANT_PROMPTS:
+        return rich_buttons([[btn("✖️ Cancel", "gr|build|0", "danger")]])
     return prompt_markup(name)
+
+
+def prompt_text_for(st: dict[str, Any]) -> str:
+    op = st.get("op")
+    if op == "val":
+        return val_prompt(st["field"], st.get("cmd"))
+    if op in GRANT_PROMPTS:
+        return GRANT_PROMPTS[op]
+    return PROMPTS.get(op, "")
 
 
 def _back_view(st: dict[str, Any]) -> tuple[str, InlineKeyboardMarkup]:
@@ -2370,6 +2637,10 @@ def _back_view(st: dict[str, Any]) -> tuple[str, InlineKeyboardMarkup]:
         return render_blocklist()
     if op == "blkadd" and name in SOURCES:
         return render_cmd_blocklist(name)
+    if op == "val":
+        return render_cmd_cfg(name) if name in SOURCES else (render_settings() if name is None else render_cmd_list())
+    if op in GRANT_PROMPTS:
+        return render_grant_builder(st.get("admin", 0))
     return _panel_or_list(name)
 
 
@@ -2445,6 +2716,47 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
             await _show(context, st, f"✅ <b>/{name} created.</b> Customise it below.\n\n" + render_cmd_panel(name)[0],
                         render_cmd_panel(name)[1])
             return True
+    elif op == "val":
+        field = st["field"]
+        if name is not None and src is None:
+            INPUT.pop(uid, None)
+            await _show(context, st, *render_cmd_list())
+            return True
+        good, val = parse_maint(text) if field == "maint" else parse_field(field, text)
+        if not good:
+            err = val
+        elif name is None:  # global setting
+            if val is None:
+                err = "Global settings need a real value, not “global”."
+            elif field == "cooldown":
+                SETTINGS["cooldown"] = float(val)
+            else:
+                SETTINGS[field] = int(val)
+        elif field == "maint":
+            src["maintenance"] = val != 0
+            src["maint_until"] = time.time() + val if val > 0 else 0.0
+        else:
+            src[field] = val
+    elif op in GRANT_PROMPTS:
+        st["admin"] = uid
+        d = GRANT_DRAFT.setdefault(uid, new_draft())
+        if op == "grantuid":
+            if text.lstrip("-").isdigit():
+                d["uid"] = int(text)
+            else:
+                err = "Send the numeric Telegram user ID."
+        elif op == "grantlimit":
+            good, val = parse_field("daily_limit", text)
+            if not good or val is None:
+                err = "Send a number (e.g. <code>37</code>) or <code>unlimited</code>."
+            else:
+                d["limit"] = val
+        else:
+            mins = parse_duration(text)
+            if mins is None:
+                err = "Send a duration like <code>12h</code>, <code>10d</code>, <code>2w</code> or <code>perm</code>."
+            else:
+                d["secs"] = mins * 60
     elif op == "gblock":
         norms = parse_block_input(text)
         if not norms:
@@ -2463,6 +2775,13 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
             src["blocked"] = list(dict.fromkeys((src.get("blocked") or []) + norms))[:500]
     elif op == "maintmsg":
         src["maint_msg"] = "" if text.lower() == "clear" else shorten(text, 200)
+    elif op == "backup":
+        if text.lower() == "clear":
+            src["backup_url"] = ""
+        elif text.startswith(("http://", "https://")) and len(text) <= 2000:
+            src["backup_url"] = text
+        else:
+            err = "That is not a valid http(s) URL."
     elif op == "title":
         src["title"] = shorten(text, 40) or src["title"]
     elif op == "emoji":
@@ -2517,13 +2836,13 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
                 err = "Send a valid JSON object."
 
     if err:
-        await _show(context, st, f"⚠️ {err}\n\n" + PROMPTS.get(op, ""), _prompt_markup_for(st))
+        await _show(context, st, f"⚠️ {err}\n\n" + prompt_text_for(st), _prompt_markup_for(st))
         return True
 
     INPUT.pop(uid, None)
     save_state()
     QUERY_CACHE.clear()
-    if op in {"title", "emoji"}:
+    if op in {"title", "emoji"} or (op == "val" and st.get("field") == "maint"):
         await refresh_commands(context.bot)
     await _show(context, st, *_back_view(st))
     return True
@@ -2552,6 +2871,11 @@ async def handle_cx(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str
         await _safe_edit(query, *_panel_or_list(name))
         return
 
+    if op == "cancelset":
+        await query.answer("Cancelled")
+        await _safe_edit(query, *render_settings())
+        return
+
     if op == "cancelg":
         await query.answer("Cancelled")
         await _safe_edit(query, *render_blocklist())
@@ -2568,17 +2892,40 @@ async def handle_cx(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str
         await query.answer()
         await _safe_edit(query, *render_cmd_panel(name))
     elif op == "maint":
-        src["maintenance"] = not src.get("maintenance", False)
+        src["maintenance"] = not maint_active(src)
+        src["maint_until"] = 0.0
         persist()
         await refresh_commands(context.bot)
         await query.answer("🛠 Maintenance ON" if src["maintenance"] else "✅ Back online")
+        await _safe_edit(query, *render_cmd_panel(name))
+    elif op.startswith("val_"):
+        field = VAL_FIELDS.get(op[4:])
+        if not field:
+            await query.answer("Unknown setting.")
+            return
+        await query.answer()
+        INPUT[uid] = {"op": "val", "cmd": name, "field": field, "chat": query.message.chat_id,
+                      "mid": query.message.message_id, "ts": time.time()}
+        await _safe_edit(query, val_prompt(field, name), prompt_markup(name, "cfg"))
+    elif op == "brk":
+        BREAKER.pop(name, None)
+        await query.answer("Breaker reset ✅")
         await _safe_edit(query, *render_cmd_panel(name))
     elif op == "cfg":
         await query.answer()
         await _safe_edit(query, *render_cmd_cfg(name))
     elif op.startswith("set_"):
         _, code, val = op.split("_", 2)
-        field = {"cd": "cooldown", "dl": "daily_limit", "ad": "auto_delete", "nl": "no_log"}.get(code)
+        if code == "mt":  # timed maintenance: seconds, 0 = off, -1 = until switched off
+            secs = int(val)
+            src["maintenance"] = secs != 0
+            src["maint_until"] = time.time() + secs if secs > 0 else 0.0
+            persist()
+            await refresh_commands(context.bot)
+            await query.answer("🛠 Maintenance ON" if secs else "✅ Back online")
+            await _safe_edit(query, *render_cmd_cfg(name))
+            return
+        field = {"cd": "cooldown", "dl": "daily_limit", "ad": "auto_delete", "nl": "no_log", "ct": "cache_ttl"}.get(code)
         if not field:
             await query.answer("Unknown setting.")
             return
@@ -2756,11 +3103,731 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # --------------------------------------------------------------------------- #
+# Reliability, safety and operations                                           #
+# --------------------------------------------------------------------------- #
+
+
+def fmt_left(seconds: float) -> str:
+    sec = int(max(0, seconds))
+    if sec < 90:
+        return f"{sec}s"
+    mins = sec // 60
+    if mins < 120:
+        return f"{mins}m"
+    hours = mins // 60
+    if hours < 48:
+        return f"{hours}h {mins % 60}m"
+    return f"{hours // 24}d {hours % 24}h"
+
+
+def fmt_minutes(m: int) -> str:
+    if m <= 0:
+        return "permanent"
+    if m % 1440 == 0:
+        return f"{m // 1440}d"
+    if m % 60 == 0:
+        return f"{m // 60}h"
+    return f"{m}m"
+
+
+def parse_duration(tok: str) -> int | None:
+    """'30m' / '6h' / '7d' / '2w' / 'perm' -> minutes (0 = permanent); None when not a duration."""
+    t = tok.strip().lower()
+    if t in {"perm", "permanent", "forever"}:
+        return 0
+    m = re.fullmatch(r"(\d+)([mhdw]?)", t)
+    if not m:
+        return None
+    return int(m.group(1)) * {"": 1, "m": 1, "h": 60, "d": 1440, "w": 10080}[m.group(2)]
+
+
+def is_banned(uid: int) -> bool:
+    if uid not in BANNED:
+        return False
+    until = (BAN_INFO.get(uid) or {}).get("until") or 0
+    if until and time.time() >= until:  # temporary ban ran out
+        BANNED.discard(uid)
+        BAN_INFO.pop(uid, None)
+        persist()
+        return False
+    return True
+
+
+def ban_user(uid: int, minutes: int = 0, reason: str = "", by: int = 0) -> None:
+    BANNED.add(uid)
+    BAN_INFO[uid] = {"until": time.time() + minutes * 60 if minutes else 0.0, "reason": reason[:120], "by": by}
+    persist()
+
+
+def unban_user(uid: int) -> None:
+    BANNED.discard(uid)
+    BAN_INFO.pop(uid, None)
+    STRIKES.pop(uid, None)
+    persist()
+
+
+def maint_active(src: dict[str, Any]) -> bool:
+    if not src.get("maintenance"):
+        return False
+    until = src.get("maint_until") or 0
+    return not (until and time.time() >= until)
+
+
+def maint_text(src: dict[str, Any]) -> str:
+    if not maint_active(src):
+        return "off"
+    until = src.get("maint_until") or 0
+    return f"ON · ends in {fmt_left(until - time.time())}" if until else "ON · until switched off"
+
+
+def breaker_text(name: str | None) -> str:
+    bk = BREAKER.get(name or "-")
+    if not bk:
+        return "ok"
+    if bk["until"] > time.time():
+        return f"🔴 open · {fmt_left(bk['until'] - time.time())}"
+    return f"🟡 {bk['fails']} recent failure(s)"
+
+
+def group_allows(gid: int, cmd: str | None) -> bool:
+    cmds = (ALLOWED_GROUPS.get(gid) or {}).get("cmds")
+    return cmds is None or (cmd or "num") in cmds
+
+
+def src_stat(name: str | None, hits: int = 0, ms: int = 0, err: bool = False) -> None:
+    st = SRC_STATS.setdefault(name or "-", {"n": 0, "hits": 0, "err": 0, "lat": 0})
+    st["n"] += 1
+    if err:
+        st["err"] += 1
+        return
+    st["lat"] += ms
+    if hits:
+        st["hits"] += 1
+
+
+def src_stats_line(name: str | None) -> str:
+    st = SRC_STATS.get(name or "-")
+    if not st or not st["n"]:
+        return "no lookups yet"
+    ok = st["n"] - st["err"]
+    hit = round(100 * st["hits"] / ok) if ok else 0
+    avg = round(st["lat"] / ok) if ok else 0
+    return f"{st['n']} lookups · {hit}% hits · {avg}ms · {st['err']} errors"
+
+
+def cmd_stats_block() -> str:
+    if not SRC_STATS:
+        return ""
+    rows = []
+    for name, st in sorted(SRC_STATS.items(), key=lambda kv: -kv[1]["n"])[:6]:
+        ok = st["n"] - st["err"]
+        hit = round(100 * st["hits"] / ok) if ok else 0
+        avg = round(st["lat"] / ok) if ok else 0
+        label = "/num" if name == "-" else f"/{name}"
+        rows.append(f"<b>{esc(label)}</b> ▸ <code>{st['n']}</code> · ✅ {hit}% · ⚡ {avg}ms · ⚠️ {st['err']}")
+    return "\n\n📊 <b>BY COMMAND</b>\n" + tree(rows)
+
+
+async def strike(bot, user, why: str, weight: int = 1) -> bool:
+    """Abuse guard: too many violations in 10 minutes -> automatic temporary ban + admin alert."""
+    if user is None or not SETTINGS["abuse_guard"] or is_admin(user.id):
+        return False
+    now = time.time()
+    dq = STRIKES.setdefault(user.id, deque(maxlen=200))
+    for _ in range(weight):
+        dq.append(now)
+    while dq and now - dq[0] > 600:
+        dq.popleft()
+    if len(dq) < int(SETTINGS["strike_limit"]):
+        return False
+    STRIKES.pop(user.id, None)
+    minutes = int(SETTINGS["ban_minutes"])
+    ban_user(user.id, minutes, f"auto: {why}", 0)
+    await notify_admins(
+        bot,
+        f"🚨 <b>AUTO-BAN</b>\n{DIV}\n"
+        + block_table([
+            ("👤 User", f"{user.full_name} ({user.id})"),
+            ("⏱ Duration", fmt_minutes(minutes)),
+            ("📝 Reason", why),
+        ]),
+        rich_buttons([[btn("✅ Unban", f"ub|{user.id}|0", "success")]]),
+    )
+    return True
+
+
+async def breaker_fail(bot, name: str | None) -> None:
+    """Circuit breaker: repeated API failures pause the command and alert the admins once."""
+    key = name or "-"
+    bk = BREAKER.setdefault(key, {"fails": 0, "until": 0.0, "alerted": False})
+    bk["fails"] += 1
+    if bk["fails"] < int(SETTINGS["breaker_fails"]):
+        return
+    minutes = int(SETTINGS["breaker_minutes"])
+    bk["until"] = time.time() + minutes * 60
+    if not bk["alerted"]:
+        bk["alerted"] = True
+        await notify_admins(
+            bot,
+            f"🧯 <b>CIRCUIT BREAKER TRIPPED</b>\n{DIV}\n"
+            + block_table([
+                ("🔌 Command", "/num" if key == "-" else f"/{key}"),
+                ("❌ Failures in a row", str(bk["fails"])),
+                ("⏸ Paused for", f"{minutes}m"),
+            ])
+            + "\n<i>Users get a friendly notice, admins can still test, and it re-tests itself automatically.</i>",
+            rich_buttons([[btn("🧯 Reset now", f"brk|{key}|0", "success")]]),
+        )
+
+
+def render_security() -> tuple[str, InlineKeyboardMarkup]:
+    s = SETTINGS
+    onoff = lambda v: "ON" if v else "off"  # noqa: E731
+    text = (
+        f"🔐 <b>SECURITY &amp; RELIABILITY</b>\n{DIV}\n"
+        + block_table([
+            ("🚨 Abuse guard", onoff(s["abuse_guard"])),
+            ("⚡ Strikes before auto-ban", f"{s['strike_limit']} / 10 min"),
+            ("⏱ Auto-ban length", fmt_minutes(int(s["ban_minutes"]))),
+            ("🧯 Breaker trips after", f"{s['breaker_fails']} failures"),
+            ("⏸ Breaker pause", f"{s['breaker_minutes']}m"),
+            ("📜 Audit log", f"{onoff(s['audit'])} · {AUDIT_DAYS} days (MongoDB)"),
+            ("📰 Daily digest", f"{onoff(s['digest'])} · {DIGEST_HOUR:02d}:00 UTC"),
+        ])
+        + "\n\n<i>Strikes: rate-limit hits and protected-query attempts. Admins are never struck.</i>"
+    )
+    rows = [
+        [_toggle("ag", "Abuse guard", s["abuse_guard"]), _toggle("au", "Audit log", s["audit"])],
+        [_toggle("dg", "Daily digest", s["digest"])],
+        [btn("🚨 Strikes before auto-ban", "noop", None)],
+        _opt_row("sl", s["strike_limit"], [("5", 5), ("8", 8), ("15", 15), ("30", 30)]),
+        [btn("⏱ Auto-ban length", "noop", None)],
+        _opt_row("bm", s["ban_minutes"], [("15m", 15), ("1h", 60), ("6h", 360), ("24h", 1440)]),
+        [btn("🧯 Breaker: failures to trip", "noop", None)],
+        _opt_row("bf", s["breaker_fails"], [("3", 3), ("5", 5), ("10", 10)]),
+        [btn("⏸ Breaker: pause length", "noop", None)],
+        _opt_row("bk", s["breaker_minutes"], [("2m", 2), ("5m", 5), ("15m", 15)]),
+        ADMIN_BACK,
+    ]
+    return text, rich_buttons(rows)
+
+
+def render_group_view(gid: int) -> tuple[str, InlineKeyboardMarkup]:
+    meta = ALLOWED_GROUPS.get(gid)
+    if meta is None:
+        return "⚪ That group is no longer authorized.", rich_buttons([[btn("⬅️ Groups", "adm|groups|0")]])
+    cmds = meta.get("cmds")
+    names = ["num"] + list(SOURCES)
+    allowed = names if cmds is None else [n for n in names if n in cmds]
+    cap = int(meta.get("cap") or 0)
+    muted = bool(meta.get("muted"))
+    text = (
+        f"⚙️ <b>{esc(meta.get('title', gid))}</b>\n{DIV}\n"
+        + tree([
+            f"🆔 <b>ID</b> ▸ <code>{gid}</code>",
+            f"🔇 <b>Muted</b> ▸ <code>{'YES - the bot stays silent' if muted else 'no'}</code>",
+            f"📅 <b>Group daily cap</b> ▸ <code>{'∞' if not cap else cap}</code> <i>(all members together)</i>",
+            f"🧩 <b>Commands here</b> ▸ <code>{'all' if cmds is None else (', '.join('/' + n for n in allowed) or 'none')}</code>",
+        ])
+        + "\n\n<i>Admins are never limited by these settings.</i>"
+    )
+    rows: list[list[InlineKeyboardButton]] = [
+        [btn("🔊 Unmute group" if muted else "🔇 Mute group", f"adm|gmute_{gid}|0", "success" if muted else "danger")],
+        [btn("📅 Group daily cap", "noop", None)],
+        [btn(f"{'✅ ' if cap == v else ''}{label}", f"adm|gcap_{gid}_{v}|0", "success" if cap == v else "primary")
+         for label, v in (("∞", 0), ("50", 50), ("100", 100), ("300", 300), ("1000", 1000))],
+        [btn("🧩 Commands allowed here", "noop", None)],
+    ]
+    toggles = [
+        btn(f"{'✅' if n in allowed else '⛔'} /{n}", f"adm|gcmd_{gid}_{n}|0", "success" if n in allowed else "danger")
+        for n in names
+    ]
+    for i in range(0, len(toggles), 2):
+        rows.append(toggles[i : i + 2])
+    rows.append([btn("🚪 Leave", f"lg|{gid}|0", "danger"), btn("⬅️ Groups", "adm|groups|0")])
+    return text, rich_buttons(rows)
+
+
+def render_optouts() -> tuple[str, InlineKeyboardMarkup]:
+    items = list(OPTOUTS.items())[:10]
+    body = "\n".join(
+        f"🛡 <code>{esc(mask_norm(q['norm']))}</code> · {esc(q['name'])} · {esc(q['where'])}" for _, q in items
+    ) or "<i>No pending requests.</i>"
+    text = (
+        f"📬 <b>OPT-OUT REQUESTS</b> <i>({len(OPTOUTS)})</i>\n{DIV}\n{body}\n\n"
+        "<i>Members send <code>/optout &lt;number/username&gt;</code>. Approving adds it to Protected queries.</i>"
+    )
+    rows = []
+    for rid, q in items:
+        rows.append([btn(f"✅ Protect {mask_norm(q['norm'])}", f"oo|{rid}|1", "success"),
+                     btn("❌ Decline", f"oo|{rid}|0", "danger")])
+    rows.append(ADMIN_BACK)
+    return text, rich_buttons(rows)
+
+
+async def cmd_setlimit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    args = list(context.args or [])
+    reply = update.effective_message.reply_to_message
+    target = None
+    if reply and reply.from_user:
+        target = reply.from_user.id
+    elif args and args[0].lstrip("-").isdigit():
+        target = int(args.pop(0))
+    val = args[0].lower() if args else ""
+    if target is None or not val:
+        await update.effective_message.reply_html(
+            "Usage: <code>/setlimit &lt;user_id&gt; &lt;number|unlimited|off&gt;</code> (or reply with <code>/setlimit 100</code>)\n"
+            "Overrides the daily limit on <b>every</b> command for that user. <code>off</code> removes the override."
+        )
+        return
+    if val in {"off", "reset", "default"}:
+        USER_LIMITS.pop(target, None)
+        note = "override removed"
+    elif val in {"unlimited", "inf", "∞", "0"}:
+        USER_LIMITS[target] = 0
+        note = "unlimited"
+    elif val.isdigit():
+        USER_LIMITS[target] = int(val)
+        note = f"{int(val)} lookups/day"
+    else:
+        await update.effective_message.reply_html("⚠️ Send a number, <code>unlimited</code> or <code>off</code>.")
+        return
+    persist()
+    await update.effective_message.reply_html(f"✅ <code>{target}</code> ▸ <b>{note}</b>")
+
+
+async def cmd_limits(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if not USER_LIMITS:
+        await update.effective_message.reply_html("📅 No per-user limit overrides.\nSet one with <code>/setlimit &lt;user_id&gt; &lt;n&gt;</code>.")
+        return
+    lines = [
+        f"<code>{uid}</code> · {esc(USER_STATS.get(uid, {}).get('name', 'unknown'))} ▸ <b>{'unlimited' if not n else n}</b>"
+        for uid, n in sorted(USER_LIMITS.items())
+    ]
+    await update.effective_message.reply_html(f"📅 <b>PER-USER LIMITS</b>\n{DIV}\n" + tree(lines[:40]))
+
+
+async def cmd_optout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anyone in an allowed group can ask for their own number / username to be protected."""
+    user, chat, msg = update.effective_user, update.effective_chat, update.effective_message
+    if user is None or chat is None:
+        return
+    norms = parse_block_input(" ".join(context.args or []))
+    try:
+        await msg.delete()  # never leave the number in the chat
+    except TelegramError:
+        pass
+
+    async def say(text: str) -> None:
+        sent = await context.bot.send_message(chat.id, text, parse_mode=ParseMode.HTML)
+        autodelete(context.bot, sent, delay=30)
+
+    if not norms:
+        await say("🛡 <b>Opt-out</b>\nUsage: <code>/optout &lt;your number / username / email&gt;</code>\n"
+                  "Your message is deleted instantly and an admin reviews the request.")
+        return
+    ck = (user.id, today_utc())
+    if OPTOUT_COUNT.get(ck, 0) >= 3 and not is_admin(user.id):
+        await say("⏳ You've reached today's request limit.")
+        return
+    n = norms[0]
+    if n in BLOCKED:
+        await say("✅ That query is already protected.")
+        return
+    OPTOUT_COUNT[ck] = OPTOUT_COUNT.get(ck, 0) + 1
+    if is_admin(user.id):
+        BLOCKED.add(n)
+        persist()
+        QUERY_CACHE.clear()
+        await say("🛡 Protected.")
+        return
+    rid = secrets.token_hex(4)
+    OPTOUTS[rid] = {"norm": n, "uid": user.id, "name": display_name(user),
+                    "where": "DM" if chat.type == ChatType.PRIVATE else (chat.title or str(chat.id)), "ts": time.time()}
+    await notify_admins(
+        context.bot,
+        f"📬 <b>OPT-OUT REQUEST</b>\n{DIV}\n"
+        + block_table([("🛡 Query", mask_norm(n)), ("👤 From", f"{display_name(user)} ({user.id})"),
+                       ("📍 Where", OPTOUTS[rid]["where"])]),
+        rich_buttons([[btn("✅ Protect", f"oo|{rid}|1", "success"), btn("❌ Decline", f"oo|{rid}|0", "danger")]]),
+    )
+    await say("🛡 <b>Request received.</b> An admin will review it shortly.")
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = uid_of(update)
+    text = (update.effective_message.text or "").partition(" ")[2].strip()
+    if not text:
+        await update.effective_message.reply_html("Usage: <code>/broadcast &lt;message&gt;</code>\nYou'll get a preview before anything is sent.")
+        return
+    BROADCAST[uid] = text[:3000]
+    await update.effective_message.reply_html(
+        f"📣 <b>PREVIEW</b>\n{DIV}\n{esc(text[:3000])}\n{DIV}\nSend to <b>{len(ALLOWED_GROUPS)}</b> group(s)?",
+        reply_markup=rich_buttons([[btn("📣 Send", "bc|go|1", "success"), btn("✖️ Cancel", "bc|no|0", "danger")]]),
+    )
+
+
+async def send_backup(bot, chat_id: int) -> None:
+    snap = snapshot()
+    payload = {
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "version": 2,
+        **{**snap, "groups": {str(k): v for k, v in snap["groups"].items()},
+           "limits": {str(k): v for k, v in snap["limits"].items()}},
+    }
+    blob = json.dumps(payload, indent=2, ensure_ascii=False, default=str).encode("utf-8")
+    sent = await bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(io.BytesIO(blob), filename="osint_bot_backup.json"),
+        caption="💾 <b>CONFIG BACKUP</b>\n⚠️ <i>Contains API URLs and keys - keep it private.</i>\n⏳ <i>Self-destructs in 60s</i>",
+        parse_mode=ParseMode.HTML,
+    )
+    autodelete(bot, sent, delay=60)
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_backup(context.bot, update.effective_chat.id)
+
+
+async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    hours = int(context.args[0]) if context.args and context.args[0].isdigit() else 24
+    hours = max(1, min(hours, 24 * AUDIT_DAYS))
+    since = time.time() - hours * 3600
+    rows: list[dict[str, Any]] = []
+    try:
+        rows = await STORE.export_log(since) if STORE else []
+    except Exception:  # noqa: BLE001
+        pass
+    if not rows:
+        rows = [e for e in LOG if e["ts"] >= since]
+    blob = json.dumps({"since_hours": hours, "count": len(rows), "entries": rows}, indent=2,
+                      ensure_ascii=False, default=str).encode("utf-8")
+    sent = await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=InputFile(io.BytesIO(blob), filename=f"audit_{hours}h.json"),
+        caption=f"📜 <b>AUDIT LOG</b> · last {hours}h · {len(rows)} entries\n⏳ <i>Self-destructs in 2 min</i>",
+        parse_mode=ParseMode.HTML,
+    )
+    autodelete(context.bot, sent, delay=120)
+
+
+async def maybe_digest(bot, force: bool = False, chat_id: int | None = None) -> None:
+    now = datetime.now(timezone.utc)
+    if not force and (not SETTINGS["digest"] or now.hour != DIGEST_HOUR or DIGEST["day"] == today_utc()):
+        return
+    base = DIGEST["base"]
+    d_n = STATS["searches"] - base["searches"]
+    d_h = STATS["hits"] - base["hits"]
+    d_e = STATS["errors"] - base["errors"]
+    d_u = len(STATS["users"]) - base["users"]
+    top = sorted(((SRC_STATS[n]["n"] - base["src"].get(n, 0), n) for n in SRC_STATS), reverse=True)[:5]
+    top_lines = [f"<b>{'/num' if n == '-' else '/' + esc(n)}</b> ▸ <code>{c}</code>" for c, n in top if c > 0]
+    text = (
+        f"📰 <b>DAILY DIGEST</b>\n{DIV}\n"
+        + block_table([
+            ("🔎 Lookups", str(d_n)),
+            ("✅ Hit rate", f"{round(100 * d_h / d_n)}%" if d_n else "-"),
+            ("⚠️ Errors", str(d_e)),
+            ("👥 New users", str(max(0, d_u))),
+            ("🚫 Active bans", str(sum(1 for u in BANNED if is_banned(u)))),
+            ("🧯 Breakers open", str(sum(1 for b in BREAKER.values() if b["until"] > time.time()))),
+            ("🛠 In maintenance", str(sum(1 for c in SOURCES.values() if maint_active(c)))),
+            ("📬 Opt-outs pending", str(len(OPTOUTS))),
+        ])
+        + (("\n\n🏆 <b>TOP COMMANDS</b>\n" + tree(top_lines)) if top_lines else "")
+    )
+    if chat_id is not None:
+        await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+    else:
+        await notify_admins(bot, text)
+    if not force:
+        DIGEST["day"] = today_utc()
+        DIGEST["base"] = {"searches": STATS["searches"], "hits": STATS["hits"], "errors": STATS["errors"],
+                          "users": len(STATS["users"]), "src": {n: SRC_STATS[n]["n"] for n in SRC_STATS}}
+
+
+async def housekeeping_tick(bot) -> None:
+    now = time.time()
+    changed = False
+    for src in SOURCES.values():
+        if src.get("maintenance") and src.get("maint_until") and now >= src["maint_until"]:
+            src["maintenance"], src["maint_until"] = False, 0.0
+            changed = True
+    for uid in [u for u, i in BAN_INFO.items() if i.get("until") and now >= i["until"]]:
+        BANNED.discard(uid)
+        BAN_INFO.pop(uid, None)
+        changed = True
+    for key in [k for k, g in GRANTS.items() if g.get("until") and now >= g["until"]]:
+        GRANTS.pop(key, None)  # timed grants end by themselves
+        changed = True
+    for uid, dq in list(STRIKES.items()):
+        while dq and now - dq[0] > 600:
+            dq.popleft()
+        if not dq:
+            STRIKES.pop(uid, None)
+    for rid in [r for r, q in OPTOUTS.items() if now - q["ts"] > 7 * 86400]:
+        OPTOUTS.pop(rid, None)
+    today = today_utc()
+    for k in [k for k in OPTOUT_COUNT if k[1] != today]:
+        OPTOUT_COUNT.pop(k, None)
+    if changed:
+        persist()
+        await refresh_commands(bot)
+    await maybe_digest(bot)
+
+
+async def housekeeping(bot) -> None:
+    """Every minute: end timed maintenance, expire temp bans, prune stale state, send the digest."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await housekeeping_tick(bot)
+        except Exception:  # noqa: BLE001
+            log.exception("housekeeping failed")
+
+
+# --------------------------------------------------------------------------- #
+# Manual values and per-user grants                                            #
+# --------------------------------------------------------------------------- #
+
+UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+VAL_FIELDS = {"cd": "cooldown", "dl": "daily_limit", "ad": "auto_delete", "ct": "cache_ttl", "mt": "maint"}
+GRANT_PROMPTS = {
+    "grantuid": "🔢 <b>User ID</b>\nSend the person's numeric Telegram user ID.\n<i>Tip: “Pick recent user” lists people the bot has already seen.</i>",
+    "grantlimit": "🔢 <b>Daily lookups</b>\nSend a number such as <code>37</code>, or <code>unlimited</code>.",
+    "grantdur": "⏳ <b>How long?</b>\nSend a duration such as <code>90m</code>, <code>12h</code>, <code>10d</code>, <code>2w</code> - or <code>perm</code> for no end.",
+}
+
+
+def _secs(t: str) -> float | None:
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([smhd]?)", t)
+    return float(m.group(1)) * UNIT_SECONDS[m.group(2) or "s"] if m else None
+
+
+def parse_field(field: str, text: str) -> tuple[bool, Any]:
+    """Parse a manually typed value. (True, None) means 'follow the global setting'."""
+    t = text.strip().lower()
+    if t in {"g", "global", "default", "reset"}:
+        return True, None
+    if field == "daily_limit":
+        if t in {"unlimited", "inf", "∞", "none"}:
+            return True, 0
+        if t.isdigit() and int(t) <= 1_000_000:
+            return True, int(t)
+        return False, "Send a whole number (e.g. <code>37</code>), <code>unlimited</code> or <code>global</code>."
+    v = 0.0 if t in {"off", "never", "none"} else _secs(t)
+    if field == "cooldown":
+        if v is None or v > 3600:
+            return False, "Send seconds or a duration up to 1h, e.g. <code>7</code>, <code>45s</code>, <code>2m</code>."
+        return True, float(v)
+    if v is None or v > 7 * 86400:
+        return False, "Send a duration up to 7d, e.g. <code>90s</code>, <code>10m</code>, <code>2h</code> or <code>off</code>."
+    return True, int(v)
+
+
+def parse_maint(text: str) -> tuple[bool, Any]:
+    t = text.strip().lower()
+    if t in {"off", "0", "stop", "end"}:
+        return True, 0
+    if t in {"perm", "permanent", "forever", "indefinite"}:
+        return True, -1
+    mins = parse_duration(t)
+    if mins is None or mins <= 0 or mins > 90 * 1440:
+        return False, "Send a duration such as <code>45m</code>, <code>3h</code>, <code>2d</code>, <code>perm</code> or <code>off</code>."
+    return True, mins * 60
+
+
+def val_prompt(field: str, name: str | None) -> str:
+    scope = f"/{esc(name)}" if name else "all commands"
+    what = {
+        "cooldown": ("⏱ <b>Cooldown per user</b>", "seconds or a duration (max 1h): <code>7</code>, <code>45s</code>, <code>2m</code>"),
+        "daily_limit": ("📅 <b>Daily limit per user</b>", "a number: <code>37</code> - or <code>unlimited</code>"),
+        "auto_delete": ("🧹 <b>Auto-delete timer</b>", "how long results stay: <code>90s</code>, <code>3m</code>, <code>1h</code> - or <code>off</code>"),
+        "cache_ttl": ("♻️ <b>Result cache</b>", "how long identical lookups are reused: <code>45s</code>, <code>10m</code>, <code>2h</code> - or <code>off</code>"),
+        "maint": ("🛠 <b>Maintenance length</b>", "how long it lasts: <code>45m</code>, <code>3h</code>, <code>2d</code>, <code>perm</code> - or <code>off</code>"),
+    }[field]
+    tail = "" if (name is None or field == "maint") else "\nSend <code>global</code> to follow the global setting again."
+    return f"✏️ {what[0]} · <i>{scope}</i>\nSend {what[1]}.{tail}"
+
+
+def new_draft() -> dict[str, Any]:
+    return {"uid": None, "cmd": "*", "limit": 0, "secs": 0}
+
+
+def grant_label(cmd: str) -> str:
+    return "all commands" if cmd == "*" else ("/num" if cmd == "-" else f"/{cmd}")
+
+
+def grant_scope_key(tok: str) -> str | None:
+    t = tok.strip().lower().lstrip("/")
+    if t in {"all", "*", "everything"}:
+        return "*"
+    if t in {"num", "default", "-", "search"}:
+        return "-"
+    return t if t in SOURCES else None
+
+
+def set_grant(uid: int, cmd: str, limit: int, secs: int, by: int) -> None:
+    GRANTS[(uid, cmd)] = {"limit": int(limit), "until": time.time() + secs if secs else 0.0, "by": by}
+    persist()
+
+
+def grant_line(uid: int, cmd: str, g: dict[str, Any]) -> str:
+    name = USER_STATS.get(uid, {}).get("name", "unknown")
+    amount = "unlimited" if not g["limit"] else f"{g['limit']}/day"
+    ends = f"ends in {fmt_left(g['until'] - time.time())}" if g.get("until") else "no end"
+    return f"{'♾' if not g['limit'] else '🔢'} <code>{uid}</code> · {esc(shorten(name, 18))} ▸ {esc(grant_label(cmd))} ▸ <b>{amount}</b> · {ends}"
+
+
+def render_grants() -> tuple[str, InlineKeyboardMarkup]:
+    now = time.time()
+    live = [(k, g) for k, g in sorted(GRANTS.items()) if not (g.get("until") and now >= g["until"])][:15]
+    body = "\n".join(grant_line(u, c, g) for (u, c), g in live) or "<i>No grants yet.</i>"
+    text = (
+        f"🎁 <b>GRANTS</b> <i>({len(live)})</i>\n{DIV}\n{body}\n\n"
+        "<i>A grant replaces the normal daily limit for one person - on one command or all. "
+        "Cooldowns still apply. Quick add: <code>/grant &lt;user_id&gt; &lt;command|all&gt; &lt;unlimited|N&gt; [duration]</code></i>"
+    )
+    rows = [[btn(f"🗑 {u} · {shorten(grant_label(c), 14)}", f"gr|x_{u}_{c}|0", "danger")] for (u, c), _ in live]
+    rows.append([btn("➕ New grant", "gr|new|0", "success")])
+    rows.append(ADMIN_BACK)
+    return text, rich_buttons(rows)
+
+
+def render_grant_users() -> tuple[str, InlineKeyboardMarkup]:
+    people = sorted(((u, i) for u, i in USER_STATS.items() if not is_admin(u)), key=lambda kv: -kv[1]["last"])[:12]
+    text = (
+        f"👤 <b>PICK A USER</b>\n{DIV}\n"
+        + ("People the bot has seen recently - newest first." if people else "<i>No users seen yet. Use “Enter user ID”.</i>")
+    )
+    btns = [btn(shorten(i["name"], 18) or str(u), f"gr|u_{u}|0", "primary") for u, i in people]
+    rows = [btns[i : i + 2] for i in range(0, len(btns), 2)]
+    rows.append([btn("🔢 Enter user ID", "gr|uidp|0", "success"), btn("⬅️ Back", "gr|build|0")])
+    return text, rich_buttons(rows)
+
+
+def render_grant_builder(admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    d = GRANT_DRAFT.setdefault(admin_id, new_draft())
+    who = "- not chosen -" if d["uid"] is None else f"{USER_STATS.get(d['uid'], {}).get('name', 'user')} ({d['uid']})"
+    text = (
+        f"🎁 <b>NEW GRANT</b>\n{DIV}\n"
+        + tree([
+            f"👤 <b>User</b> ▸ <code>{esc(who)}</code>",
+            f"🧩 <b>Applies to</b> ▸ <code>{esc(grant_label(d['cmd']))}</code>",
+            f"🔢 <b>Daily lookups</b> ▸ <code>{'unlimited ♾' if not d['limit'] else d['limit']}</code>",
+            f"⏳ <b>Lasts</b> ▸ <code>{'until you remove it' if not d['secs'] else fmt_left(d['secs'])}</code>",
+        ])
+        + "\n\n<i>Choose below, then tap “Create grant”. Unlimited or any number you type.</i>"
+    )
+    scopes = [("*", "All commands"), ("-", "/num")] + [(n, f"/{n}") for n in SOURCES]
+    scope_btns = [btn(f"{'✅ ' if d['cmd'] == k else ''}{label}", f"gr|c_{k}|0", "success" if d["cmd"] == k else "primary")
+                  for k, label in scopes]
+    rows: list[list[InlineKeyboardButton]] = [
+        [btn("👤 Pick recent user", "gr|pick|0", "primary"), btn("🔢 Enter user ID", "gr|uidp|0", "primary")],
+        [btn("🧩 Applies to", "noop", None)],
+    ]
+    rows += [scope_btns[i : i + 3] for i in range(0, len(scope_btns), 3)]
+    rows.append([btn("🔢 Daily lookups", "noop", None), btn("✏️ Custom", "gr|limp|0", "success")])
+    rows.append([btn(f"{'✅ ' if d['limit'] == v else ''}{label}", f"gr|l_{v}|0", "success" if d["limit"] == v else "primary")
+                 for label, v in (("∞", 0), ("10", 10), ("25", 25), ("50", 50), ("100", 100), ("500", 500))])
+    rows.append([btn("⏳ Lasts", "noop", None), btn("✏️ Custom", "gr|durp|0", "success")])
+    rows.append([btn(f"{'✅ ' if d['secs'] == v else ''}{label}", f"gr|d_{v}|0", "success" if d["secs"] == v else "primary")
+                 for label, v in (("1h", 3600), ("1d", 86400), ("7d", 604800), ("30d", 2592000), ("♾", 0))])
+    rows.append([btn("✅ Create grant", "gr|go|0", "success")])
+    rows.append([btn("🎁 All grants", "gr|list|0"), ADMIN_BACK[0]])
+    return text, rich_buttons(rows)
+
+
+def _grant_target(update: Update, args: list[str]) -> int | None:
+    reply = update.effective_message.reply_to_message
+    if reply and reply.from_user:
+        USER_STATS.setdefault(reply.from_user.id, {"name": reply.from_user.full_name, "count": 0, "last": 0.0})
+        return reply.from_user.id
+    if args and args[0].lstrip("-").isdigit():
+        return int(args.pop(0))
+    return None
+
+
+async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    args = list(context.args or [])
+    target = _grant_target(update, args)
+    if target is None or len(args) < 2:
+        await update.effective_message.reply_html(
+            "Usage: <code>/grant &lt;user_id&gt; &lt;command|all|num&gt; &lt;unlimited|N&gt; [duration]</code>\n"
+            "Examples:\n<code>/grant 123456 tg unlimited 7d</code>\n<code>/grant 123456 all 200</code>\n"
+            "Reply to someone's message with <code>/grant tg unlimited</code> to skip the ID."
+        )
+        return
+    scope = grant_scope_key(args[0])
+    if scope is None:
+        await update.effective_message.reply_html(
+            f"⚠️ Unknown command <code>{esc(args[0])}</code>. Use <code>all</code>, <code>num</code>"
+            + (" or one of: " + ", ".join(f"<code>{esc(n)}</code>" for n in SOURCES) if SOURCES else ".")
+        )
+        return
+    good, limit = parse_field("daily_limit", args[1])
+    if not good or limit is None:
+        await update.effective_message.reply_html("⚠️ Send a number or <code>unlimited</code>.")
+        return
+    secs = 0
+    if len(args) > 2:
+        mins = parse_duration(args[2])
+        if mins is None:
+            await update.effective_message.reply_html("⚠️ Duration like <code>12h</code>, <code>7d</code>, <code>2w</code> or <code>perm</code>.")
+            return
+        secs = mins * 60
+    if is_admin(target):
+        await update.effective_message.reply_html("🛡 Admins are already unlimited.")
+        return
+    set_grant(target, scope, limit, secs, user.id)
+    await update.effective_message.reply_html(
+        f"🎁 <b>Granted</b> <code>{target}</code>\n"
+        + block_table([("🧩 Applies to", grant_label(scope)),
+                       ("🔢 Daily lookups", "unlimited" if not limit else str(limit)),
+                       ("⏳ Lasts", fmt_left(secs) if secs else "until removed")])
+    )
+
+
+async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    args = list(context.args or [])
+    target = _grant_target(update, args)
+    if target is None:
+        await update.effective_message.reply_html("Usage: <code>/revoke &lt;user_id&gt; [command|all]</code> (no command = remove every grant)")
+        return
+    if args:
+        scope = grant_scope_key(args[0])
+        removed = 1 if scope is not None and GRANTS.pop((target, scope), None) is not None else 0
+    else:
+        keys = [k for k in GRANTS if k[0] == target]
+        for k in keys:
+            GRANTS.pop(k, None)
+        removed = len(keys)
+    persist()
+    await update.effective_message.reply_html(
+        f"🗑 Removed <b>{removed}</b> grant(s) from <code>{target}</code>." if removed else "That user had no matching grant."
+    )
+
+
+async def cmd_grants(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    text, markup = render_grants()
+    await update.effective_message.reply_html(text, reply_markup=markup)
+
+
+# --------------------------------------------------------------------------- #
 # Callbacks                                                                    #
 # --------------------------------------------------------------------------- #
 
 KEYED_ACTIONS = {"p", "d", "x", "f", "close"}
-ADMIN_ACTIONS = {"adm", "set", "ub", "lg", "ap", "rj", "cx"}
+ADMIN_ACTIONS = {"adm", "set", "ub", "lg", "ap", "rj", "cx", "oo", "bc", "brk", "gr"}
 
 
 async def _safe_edit(query, text: str, markup: InlineKeyboardMarkup | None) -> None:
@@ -2811,6 +3878,56 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             )
             autodelete(context.bot, sent, delay=120)
             return
+        elif key == "security":
+            await query.answer()
+        elif key == "optouts":
+            await query.answer()
+        elif key == "digest":
+            await query.answer("Sending digest…")
+            await maybe_digest(context.bot, force=True, chat_id=query.message.chat_id)
+            return
+        elif key == "backup":
+            await query.answer("Preparing backup…")
+            await send_backup(context.bot, query.message.chat_id)
+            return
+        elif key.startswith("gv_"):
+            await query.answer()
+        elif key.startswith("gmute_"):
+            meta = ALLOWED_GROUPS.get(int(key[6:]))
+            if meta is not None:
+                meta["muted"] = not meta.get("muted", False)
+                persist()
+            await query.answer("Saved ✅")
+            key = "gv_" + key[6:]
+        elif key.startswith("gcap_"):
+            _, g, n = key.split("_", 2)
+            meta = ALLOWED_GROUPS.get(int(g))
+            if meta is not None:
+                meta["cap"] = int(n)
+                persist()
+            await query.answer("Saved ✅")
+            key = f"gv_{g}"
+        elif key.startswith("gcmd_"):
+            _, g, cname = key.split("_", 2)
+            meta = ALLOWED_GROUPS.get(int(g))
+            if meta is not None:
+                names = ["num"] + list(SOURCES)
+                current = set(names if meta.get("cmds") is None else meta["cmds"])
+                current ^= {cname}
+                meta["cmds"] = None if current >= set(names) else sorted(current)
+                persist()
+            await query.answer("Saved ✅")
+            key = f"gv_{g}"
+        elif key.startswith("val_"):
+            field = VAL_FIELDS.get(key[4:])
+            if not field or field in {"cache_ttl", "maint"}:
+                await query.answer("Unknown setting.")
+                return
+            await query.answer()
+            INPUT[user_id] = {"op": "val", "cmd": None, "field": field, "chat": query.message.chat_id,
+                              "mid": query.message.message_id, "ts": time.time()}
+            await _safe_edit(query, val_prompt(field, None), prompt_markup(None, "cancelset"))
+            return
         elif key == "dbping":
             _, info = await STORE.ping() if STORE else (False, "No storage initialised")
             await query.answer(info[:190], show_alert=True)
@@ -2848,9 +3965,108 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             text, markup = render_banned()
         elif key == "blocklist":
             text, markup = render_blocklist()
+        elif key == "security":
+            text, markup = render_security()
+        elif key == "optouts":
+            text, markup = render_optouts()
+        elif key.startswith("gv_"):
+            text, markup = render_group_view(int(key[3:]))
         else:
             text, markup = render_admin()
         await _safe_edit(query, text, markup)
+        return
+
+    if action == "gr":  # grants: list, guided builder, removal
+        d = GRANT_DRAFT.setdefault(user_id, new_draft())
+        view, note = "builder", None
+        if key == "new":
+            GRANT_DRAFT[user_id] = new_draft()
+        elif key == "list":
+            view = "list"
+        elif key == "pick":
+            view = "users"
+        elif key == "build":
+            INPUT.pop(user_id, None)
+        elif key.startswith("u_"):
+            d["uid"] = int(key[2:])
+        elif key.startswith("c_"):
+            d["cmd"] = key[2:]
+        elif key.startswith("l_"):
+            d["limit"] = int(key[2:])
+        elif key.startswith("d_"):
+            d["secs"] = int(key[2:])
+        elif key in {"uidp", "limp", "durp"}:
+            await query.answer()
+            op = {"uidp": "grantuid", "limp": "grantlimit", "durp": "grantdur"}[key]
+            INPUT[user_id] = {"op": op, "cmd": None, "admin": user_id, "chat": query.message.chat_id,
+                              "mid": query.message.message_id, "ts": time.time()}
+            await _safe_edit(query, GRANT_PROMPTS[op], rich_buttons([[btn("✖️ Cancel", "gr|build|0", "danger")]]))
+            return
+        elif key == "go":
+            if d["uid"] is None:
+                await query.answer("Pick a user first.", show_alert=True)
+                return
+            if is_admin(d["uid"]):
+                await query.answer("Admins are already unlimited.", show_alert=True)
+                return
+            set_grant(d["uid"], d["cmd"], d["limit"], d["secs"], user_id)
+            note, view = "Grant created 🎁", "list"
+        elif key.startswith("x_"):
+            uid_s, _, cmd = key[2:].partition("_")
+            GRANTS.pop((int(uid_s), cmd), None)
+            persist()
+            note, view = "Grant removed", "list"
+        await query.answer(note)
+        if view == "list":
+            text, markup = render_grants()
+        elif view == "users":
+            text, markup = render_grant_users()
+        else:
+            text, markup = render_grant_builder(user_id)
+        await _safe_edit(query, text, markup)
+        return
+
+    if action == "oo":  # opt-out request decision
+        req = OPTOUTS.pop(key, None)
+        if req is None:
+            await query.answer("Already handled.")
+            await _safe_edit(query, "ℹ️ That request was already handled.", done)
+            return
+        if index == 1:
+            BLOCKED.add(req["norm"])
+            persist()
+            QUERY_CACHE.clear()
+            await query.answer("Protected ✅")
+            await _safe_edit(query, f"🛡 <b>PROTECTED</b> ▸ <code>{esc(mask_norm(req['norm']))}</code>\nRequested by {esc(req['name'])}", done)
+        else:
+            await query.answer("Declined")
+            await _safe_edit(query, f"❌ <b>DECLINED</b> ▸ <code>{esc(mask_norm(req['norm']))}</code>", done)
+        return
+
+    if action == "bc":  # broadcast confirmation
+        text = BROADCAST.pop(user_id, None)
+        if index == 0 or not text:
+            await query.answer("Cancelled")
+            await _safe_edit(query, "✖️ Broadcast cancelled.", done)
+            return
+        await query.answer("Sending…")
+        ok = fail = 0
+        for gid in list(ALLOWED_GROUPS):
+            try:
+                await context.bot.send_message(
+                    gid, f"📣 <b>Announcement</b>\n{DIV}\n{esc(text)}", parse_mode=ParseMode.HTML
+                )
+                ok += 1
+            except TelegramError:
+                fail += 1
+            await asyncio.sleep(0.05)
+        await _safe_edit(query, f"📣 <b>BROADCAST DONE</b>\n{DIV}\n✅ Sent: {ok}\n❌ Failed: {fail}", done)
+        return
+
+    if action == "brk":  # reset a circuit breaker
+        BREAKER.pop(key, None)
+        await query.answer("Breaker reset ✅")
+        await _safe_edit(query, f"🧯 <b>Breaker reset</b> for <code>{esc('/num' if key == '-' else '/' + key)}</code>.", done)
         return
 
     if action == "set":
@@ -2862,13 +4078,12 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         SETTINGS[name] = bool(index) if isinstance(current, bool) else type(current)(index)
         save_state()
         await query.answer("Saved ✅")
-        text, markup = render_settings()
+        text, markup = render_security() if key in SECURITY_KEYS else render_settings()
         await _safe_edit(query, text, markup)
         return
 
     if action == "ub":
-        BANNED.discard(int(key))
-        save_state()
+        unban_user(int(key))
         await query.answer("Unbanned ✅")
         text, markup = render_banned()
         await _safe_edit(query, text, markup)
@@ -3062,6 +4277,7 @@ async def post_init(app: Application) -> None:
     await refresh_commands(bot)
 
     app.bot_data["sweeper"] = asyncio.create_task(pending_sweeper(bot))
+    app.bot_data["housekeeping"] = asyncio.create_task(housekeeping(bot))
     me = await bot.get_me()
     log.info(
         "Online as @%s | source %s | %d admin(s) | %d group(s)",
@@ -3082,9 +4298,10 @@ async def post_init(app: Application) -> None:
 
 
 async def post_shutdown(app: Application) -> None:
-    task = app.bot_data.get("sweeper")
-    if task:
-        task.cancel()
+    for key in ("sweeper", "housekeeping"):
+        task = app.bot_data.get(key)
+        if task:
+            task.cancel()
     if STORE is not None:
         await STORE.close()
     if _SESSION and not _SESSION.closed:
@@ -3132,6 +4349,15 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=private))
     app.add_handler(CommandHandler("block", cmd_block, filters=private))
     app.add_handler(CommandHandler("unblock", cmd_unblock, filters=private))
+    app.add_handler(CommandHandler("setlimit", cmd_setlimit))   # admin-checked; reply-to-set in groups
+    app.add_handler(CommandHandler("limits", cmd_limits, filters=private))
+    app.add_handler(CommandHandler("grant", cmd_grant))      # admin-checked; reply-to-grant works in groups
+    app.add_handler(CommandHandler("revoke", cmd_revoke))
+    app.add_handler(CommandHandler("grants", cmd_grants, filters=private))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast, filters=private))
+    app.add_handler(CommandHandler("backup", cmd_backup, filters=private))
+    app.add_handler(CommandHandler("audit", cmd_audit, filters=private))
+    app.add_handler(CommandHandler("optout", cmd_optout))        # members of allowed groups + admins
     app.add_handler(MessageHandler(filters.COMMAND, on_custom_command))  # owner-defined commands (/tg ...)
 
     app.add_handler(CallbackQueryHandler(on_callback))
