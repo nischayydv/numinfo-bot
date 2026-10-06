@@ -39,6 +39,28 @@ maintenance, abuse guard (strikes -> automatic temporary ban), temp bans with re
 limit overrides, per-group mute / daily cap / command allow-list, persistent audit log (TTL),
 daily digest, /broadcast to groups, /backup export, user opt-out requests (/optout).
 
+Rich UI (Bot API 10.1-10.3)
+---------------------------
+Menus, results, record details, welcome and /commands are sent as native Rich Messages: headings,
+bordered tables, collapsible <details> sections, an optional image slideshow (MENU_IMAGES) and coloured
+buttons. Every view has a classic-HTML twin: if Telegram rejects a rich call the bot falls back
+automatically, and after repeated failures it switches the rich layer off and alerts the admins.
+Optional env: MENU_IMAGES / WELCOME_IMAGES (comma separated image URLs), OWNER_URL, UPDATES_URL, SUPPORT_URL.
+
+Moderation notices, log channel, dossiers
+-----------------------------------------
+Users are warned (twice) before an automatic ban and told every time they are banned / unbanned or try to
+use the bot while banned. A log channel receives new users, every lookup (query, hits, results preview),
+warnings, bans, grants and ops events. /user <id|@name> shows whether someone ever used the bot and exports
+their full history (queries + results) as one JSON or TXT file - history needs MongoDB.
+
+Response editor
+---------------
+Per command (and for /num): strip branding / unwanted fields from the API response (wildcards and
+dotted paths), keep only chosen fields, rename keys, scrub phrases such as '@developer', add your own
+fields, pick where the records live, hide API meta (credits left, expiry...) - with a live preview
+built from the last real response or a sample you paste.
+
 Manual values & grants
 ----------------------
 Every limit (cooldown, daily limit, auto-delete, cache, maintenance) has presets AND a '✏️ Custom'
@@ -71,11 +93,13 @@ Requirements: python-telegram-bot[rate-limiter,webhooks]>=22.7, aiohttp
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import html
 import io
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -96,10 +120,11 @@ from telegram import (
     InlineKeyboardMarkup,
     InputFile,
     LinkPreviewOptions,
+    ReplyParameters,
     Update,
 )
 from telegram.constants import ChatAction, ChatMemberStatus, ChatType, ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -173,6 +198,9 @@ SETTINGS: dict[str, Any] = {
     "abuse_guard": True, "strike_limit": 8, "ban_minutes": 60,   # auto temp-ban after N strikes / 10 min
     "breaker_fails": 5, "breaker_minutes": 5,                    # circuit breaker
     "audit": True, "digest": True,
+    "log_channel": 0, "log_search": True, "log_results": True, "log_mod": True, "log_admin": True,
+    "log_users": True, "audit_results": True, "ban_notice": True,
+    "rich_ui": True, "welcome": True, "welcome_delete": 120, "welcome_text": "",
     "cooldown": float(os.environ.get("COOLDOWN_SECONDS", "3")),
     "daily_limit": int(os.environ.get("DAILY_LIMIT", "50")),  # 0 = unlimited (admins exempt)
 }
@@ -267,6 +295,16 @@ OPTOUT_COUNT: dict[tuple[int, str], int] = {}
 BROADCAST: dict[int, str] = {}
 GRANTS: dict[tuple[int, str], dict[str, Any]] = {}   # (user, command | '-' default | '*' all) -> {limit, until, by}
 GRANT_DRAFT: dict[int, dict[str, Any]] = {}          # admin id -> grant being built in the UI
+XFORM_DEFAULTS: dict[str, Any] = {"remove": [], "only": [], "rename": {}, "scrub": [], "extra": {}, "path": "", "meta": True}
+DEFAULT_XFORM: dict[str, Any] = {}                   # response rules for /num, search and plain text
+SAMPLES: dict[str, Any] = {}                         # command ('num' = default) -> last raw API response
+USERS: dict[int, dict[str, Any]] = {}                # user registry (write-through cache of the 'users' collection)
+USERS_DIRTY: set[int] = set()
+WARNED: dict[int, int] = {}                          # uid -> highest abuse warning level already sent
+BAN_NOTICE: dict[int, float] = {}                    # uid -> last time we told a banned user they are banned
+LOGQ: asyncio.Queue = asyncio.Queue(maxsize=1000)    # outgoing log-channel messages
+LOGSTAT: dict[str, Any] = {"sent": 0, "errors": 0, "dropped": 0, "last_error": "", "alerted": False}
+LOG_INTERVAL = 1.1
 DIGEST: dict[str, Any] = {"day": today_utc(), "base": {"searches": 0, "hits": 0, "errors": 0, "users": 0, "src": {}}}
 INPUT: dict[int, dict[str, Any]] = {}    # admin id -> pending text-input state
 INPUT_TTL = 300
@@ -276,6 +314,7 @@ RESERVED = {
     "groups", "denygroup", "allowgroup", "banned", "ban", "unban", "num", "addcmd", "cmds",
     "delcmd", "cancel", "block", "unblock",
     "setlimit", "limits", "broadcast", "backup", "audit", "optout", "grant", "revoke", "grants",
+    "user", "setlog", "commands",
 }
 CMD_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 STYLE_CYCLE = ["primary", "success", "danger", "default"]
@@ -286,10 +325,11 @@ SOURCE_DEFAULTS: dict[str, Any] = {
     "cooldown": None, "daily_limit": None, "auto_delete": None, "no_log": None, "blocked": [],
     "maintenance": False, "maint_msg": "", "maint_until": 0.0,
     "backup_url": "", "cache_ttl": None,
+    "xform": {}, "example": "",
 }
 DEFAULT_PROFILE: dict[str, Any] = {
     "emoji": "🛰", "emoji_id": None, "title": "Lookup", "style": "primary",
-    "icons": {}, "hide": [], "footer": "", "min_len": None,
+    "icons": {}, "hide": [], "footer": "", "min_len": None, "xform": DEFAULT_XFORM,
 }
 
 
@@ -490,8 +530,69 @@ def persist_log(entry: dict[str, Any]) -> None:
         pass
 
 
+def shrink_results(result: Any, max_items: int = 25, max_bytes: int = 150_000) -> dict[str, Any]:
+    """What gets stored in the audit trail: what the user was shown, capped in size."""
+    items = list(result.items[:max_items])
+    while items and len(json.dumps(items, default=str)) > max_bytes:
+        items = items[: max(1, len(items) // 2)] if len(items) > 1 else []
+    return {"total": len(result.items), "stored": len(items), "items": items, "meta": result.meta}
+
+
+def when(ts: float | None = None) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)) + " UTC"
+
+
+def user_html(uid: int, name: str, username: str | None = None) -> str:
+    tag = f" · @{esc(username)}" if username else ""
+    return f'<a href="tg://user?id={uid}">{esc(name)}</a>{tag} · <code>{uid}</code>'
+
+
+def uname(uid: int) -> str:
+    return (USERS.get(uid) or {}).get("name") or USER_STATS.get(uid, {}).get("name") or "unknown"
+
+
+def logchan(cat: str, text: str) -> None:
+    """Queue a message for the log channel (non-blocking; categories can be switched off)."""
+    if not SETTINGS["log_channel"] or not SETTINGS.get(f"log_{cat}", True):
+        return
+    try:
+        LOGQ.put_nowait(text)
+    except asyncio.QueueFull:
+        LOGSTAT["dropped"] += 1
+
+
+def alog(by: int, text: str) -> None:
+    logchan("admin", f"⚙️ <b>ADMIN ACTION</b>\n{DIV}\n{user_html(by, uname(by))}\n{text}\n🕒 {when()}")
+
+
+def search_log_text(user: Any, chat: Any, query: str, hits: int, ms: int, status: str,
+                    cmd: str | None, hide: bool, result: Any) -> str:
+    icon = {"ok": "✅" if hits else "🫥", "error": "⚠️", "blocked": "🛡", "unconfigured": "🔌"}.get(status, "ℹ️")
+    where = "DM" if chat is None or chat.type == ChatType.PRIVATE else f"{chat.title} ({chat.id})"
+    lines = [
+        f"🔎 <b>LOOKUP</b> {icon} <i>{esc(status)}</i>",
+        DIV,
+        user_html(user.id, user.full_name or "?", getattr(user, "username", None)),
+        f"📍 {esc(where)}",
+        f"🧩 <b>{esc('/' + cmd if cmd else '/num')}</b> · ⚡ {ms} ms · 📦 {hits} hit(s)",
+        "🎯 <i>hidden (protected / no-log)</i>" if hide else f"🎯 <code>{esc(shorten(query, 120))}</code>",
+        f"🕒 {when()}",
+    ]
+    text = "\n".join(lines)
+    if result is not None and not hide and SETTINGS["log_results"] and result.items:
+        text += "\n\n📦 <b>Results</b>"
+        for i, item in enumerate(result.items[:3]):
+            card = render_card(item, i, 6, 100, profile(cmd))
+            if len(text) + len(card) > 3500:
+                break
+            text += "\n\n" + card
+        if len(result.items) > 3:
+            text += f"\n\n<i>… +{len(result.items) - 3} more record(s)</i>"
+    return text
+
+
 def record_activity(user, chat, query: str, hits: int, ms: int, status: str,
-                    cmd: str | None = None, hide_query: bool = False) -> None:
+                    cmd: str | None = None, hide_query: bool = False, result: Any = None) -> None:
     uid = user.id if user else 0
     name = (user.full_name if user else "?") or "?"
     where = "DM" if chat is None or chat.type == ChatType.PRIVATE else (chat.title or str(chat.id))
@@ -499,10 +600,22 @@ def record_activity(user, chat, query: str, hits: int, ms: int, status: str,
              "query": "(hidden)" if hide_query else query, "hits": hits, "ms": ms,
              "status": status, "cmd": cmd}
     LOG.append(entry)
-    persist_log(entry)
+    full = {**entry, "uname": getattr(user, "username", None), "chat_id": getattr(chat, "id", None)}
+    if result is not None and not hide_query and SETTINGS["audit_results"]:
+        full["results"] = shrink_results(result)
+    persist_log(full)
     stat = USER_STATS.setdefault(uid, {"name": name, "count": 0, "last": 0.0})
     stat.update(name=name, last=time.time())
     stat["count"] += 1
+    rec = USERS.get(uid)
+    if rec is not None:
+        rec["count"] += 1
+        key = cmd or "num"
+        rec["by_cmd"][key] = rec["by_cmd"].get(key, 0) + 1
+        rec["last"] = time.time()
+        USERS_DIRTY.add(uid)
+    if user is not None:
+        logchan("search", search_log_text(user, chat, query, hits, ms, status, cmd, hide_query, result))
 
 
 # --------------------------------------------------------------------------- #
@@ -529,7 +642,7 @@ def _sig(doc: Any) -> str:
 def snapshot() -> dict[str, Any]:
     return {
         "groups": {int(k): dict(v) for k, v in ALLOWED_GROUPS.items()},
-        "settings": dict(SETTINGS),
+        "settings": {**SETTINGS, "default_xform": json.loads(json.dumps(DEFAULT_XFORM))},
         "banned": [{"uid": u, **(BAN_INFO.get(u) or {})} for u in sorted(BANNED)],
         "sources": json.loads(json.dumps(SOURCES)),
         "blocked": sorted(BLOCKED),
@@ -547,6 +660,10 @@ def apply_loaded(data: dict[str, Any]) -> None:
                 SETTINGS[key] = bool(value) if isinstance(current, bool) else type(current)(value)
             except (TypeError, ValueError):
                 pass
+    dx = (data.get("settings") or {}).get("default_xform")
+    if isinstance(dx, dict):
+        DEFAULT_XFORM.clear()
+        DEFAULT_XFORM.update(dx)
     for item in data.get("banned", []):
         try:
             if isinstance(item, dict):
@@ -629,6 +746,18 @@ class FileStore:
     async def export_log(self, since: float, limit: int = 5000) -> list[dict[str, Any]]:
         return []
 
+    async def get_user(self, uid: int) -> dict[str, Any] | None:
+        return None
+
+    async def find_username(self, username: str) -> dict[str, Any] | None:
+        return None
+
+    async def save_users(self, recs: list[dict[str, Any]]) -> None:
+        return None
+
+    async def user_log(self, uid: int, limit: int = 500) -> list[dict[str, Any]]:
+        return [e for e in LOG if e.get("uid") == uid][-limit:]
+
     async def ping(self) -> tuple[bool, str]:
         return True, "🟡 Local files (no database configured)"
 
@@ -660,6 +789,8 @@ class MongoStore:
                 pass
         try:
             await self.db["audit"].create_index("ts")
+            await self.db["audit"].create_index("uid")
+            await self.db["users"].create_index("username_l")
         except Exception:  # noqa: BLE001
             pass
 
@@ -741,6 +872,25 @@ class MongoStore:
     async def export_log(self, since: float, limit: int = 5000) -> list[dict[str, Any]]:
         docs = await self.db["audit"].find({"ts": {"$gte": since}}).sort("ts", 1).limit(limit).to_list(length=None)
         return [{k: v for k, v in d.items() if k not in ("_id", "exp")} for d in docs]
+
+    async def get_user(self, uid: int) -> dict[str, Any] | None:
+        d = await self.db["users"].find_one({"_id": uid})
+        return {"uid": int(d["_id"]), **{k: v for k, v in d.items() if k not in ("_id", "username_l")}} if d else None
+
+    async def find_username(self, username: str) -> dict[str, Any] | None:
+        d = await self.db["users"].find_one({"username_l": username.lower()})
+        return {"uid": int(d["_id"]), **{k: v for k, v in d.items() if k not in ("_id", "username_l")}} if d else None
+
+    async def save_users(self, recs: list[dict[str, Any]]) -> None:
+        for r in recs:
+            doc = {"_id": r["uid"], **{k: v for k, v in r.items() if k != "uid"}, "username_l": (r.get("username") or "").lower()}
+            await self.db["users"].replace_one({"_id": r["uid"]}, doc, upsert=True)
+
+    async def user_log(self, uid: int, limit: int = 500) -> list[dict[str, Any]]:
+        docs = await self.db["audit"].find({"uid": uid}).sort("ts", -1).limit(limit).to_list(length=None)
+        out = [{k: v for k, v in d.items() if k not in ("_id", "exp")} for d in docs]
+        out.reverse()
+        return out
 
     async def ping(self) -> tuple[bool, str]:
         started = time.perf_counter()
@@ -918,6 +1068,7 @@ async def access_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if chat.type == ChatType.PRIVATE:
         if is_admin(user.id):
+            await touch_user(user, chat)
             return
         now = time.time()
         if not SILENT_DENY and msg and now - _DENY_NOTICE.get(user.id, 0) > 60:
@@ -935,11 +1086,16 @@ async def access_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             raise ApplicationHandlerStop
 
         if chat.id in ALLOWED_GROUPS:
+            if msg and msg.new_chat_members:  # joins are handled by the welcome handler
+                return
             if is_admin(user.id):
+                await touch_user(user, chat)
                 return
             if is_banned(user.id):
+                await banned_notice(update, context)
                 await _stop(update)
             if SETTINGS["members_can_search"]:
+                await touch_user(user, chat)
                 return
             await _stop(update)
 
@@ -1322,6 +1478,8 @@ def render_results(key: str, result: SearchResult, page: int) -> tuple[str, Inli
         for k, v in list(result.meta.items())[:3]
         if str(k).lower() not in {"query", "q"}
     ]
+    if not xf_of(p).get("meta", True):
+        extra = []
     if extra:
         box.append(f"ℹ️ <i>{esc(' · '.join(extra))}</i>")
     header = f"{emoji_html(p)} <b>{esc(str(p['title']).upper())} COMPLETE</b> ✅\n{summary_box(box)}\n"
@@ -1511,7 +1669,8 @@ def render_help() -> str:
         "<code>/addcmd</code> <code>/cmds</code> <code>/delcmd</code>\n"
         "<code>/block</code> <code>/unblock</code> <code>/setlimit</code> <code>/limits</code>\n"
         "<code>/broadcast</code> <code>/backup</code> <code>/audit</code>\n"
-        "<code>/grant</code> <code>/revoke</code> <code>/grants</code>"
+        "<code>/grant</code> <code>/revoke</code> <code>/grants</code>\n"
+        "<code>/user</code> <code>/setlog</code>"
     )
 
 
@@ -1556,6 +1715,7 @@ def render_admin() -> tuple[str, InlineKeyboardMarkup]:
             ("🧹 Auto-delete", fmt_dur(SETTINGS["auto_delete"])),
             ("🔒 Lockdown", "ON" if SETTINGS["lockdown"] else "off"),
             ("💾 Storage", storage_label()),
+            ("📡 Log channel", "connected" if SETTINGS["log_channel"] else "off"),
             ("🛠 In maintenance", str(sum(1 for c in SOURCES.values() if maint_active(c))) + " command(s)"),
             ("🧯 Breakers open", str(sum(1 for b in BREAKER.values() if b["until"] > time.time())) + " command(s)"),
             ("🗃 Cached sets", str(len(CACHE))),
@@ -1567,6 +1727,9 @@ def render_admin() -> tuple[str, InlineKeyboardMarkup]:
         [btn("⚙️ Settings", "adm|settings|0", "primary"), btn("🔐 Security", "adm|security|0", "primary")],
         [btn("🧩 Custom commands", "cx|_.list|0", "success")],
         [btn(f"🎁 Grants ({len(GRANTS)})", "gr|list|0", "success"), btn("➕ New grant", "gr|new|0", "success")],
+        [btn("🎛 /num response editor", "xf|num.panel|0", "success")],
+        [btn("👤 Find user", "us|find|0", "success"), btn("📡 Log channel", "adm|logchan|0", "primary")],
+        [btn("👋 Welcome", "adm|welcome|0", "primary"), btn("✨ Rich UI test", "adm|richtest|0", "success")],
         [btn("🛡 Groups", "adm|groups|0", "primary"), btn("🛡 Protected queries", "adm|blocklist|0", "primary")],
         [btn("📜 Activity log", "adm|activity|0", "primary"), btn("🏆 Top users", "adm|users|0", "primary")],
         [btn("🚫 Ban list", "adm|banned|0", "primary"), btn(f"📬 Opt-outs ({len(OPTOUTS)})", "adm|optouts|0", "primary")],
@@ -1583,8 +1746,12 @@ SETTING_KEYS = {
     "raw": "group_raw", "mask": "mask", "cd": "cooldown", "dl": "daily_limit", "nl": "no_log",
     "ag": "abuse_guard", "au": "audit", "dg": "digest", "sl": "strike_limit", "bm": "ban_minutes",
     "bf": "breaker_fails", "bk": "breaker_minutes",
+    "ls": "log_search", "lr": "log_results", "lm": "log_mod", "la": "log_admin", "lu": "log_users",
+    "ar": "audit_results", "bn": "ban_notice", "ri": "rich_ui", "wl": "welcome", "wd": "welcome_delete",
 }
-SECURITY_KEYS = {"ag", "au", "dg", "sl", "bm", "bf", "bk"}
+SECURITY_KEYS = {"ag", "au", "dg", "sl", "bm", "bf", "bk", "bn"}
+LOG_KEYS = {"ls", "lr", "lm", "la", "lu", "ar"}
+WELCOME_KEYS = {"wl", "wd"}
 
 
 def _opt_row(code: str, current: float, options: list[tuple[str, float]]) -> list[InlineKeyboardButton]:
@@ -1614,6 +1781,7 @@ def render_settings() -> tuple[str, InlineKeyboardMarkup]:
             ("🧾 Group raw JSON", onoff(s["group_raw"])),
             ("🙈 Field masking", onoff(s["mask"])),
             ("🕵️ No query logging", onoff(s["no_log"])),
+            ("✨ Rich UI", f"{onoff(s['rich_ui'])} · {rich_status()}"),
             ("⏱ Cooldown", f"{s['cooldown']:g}s"),
             ("📅 Daily limit", "unlimited" if not s["daily_limit"] else str(s["daily_limit"])),
         ])
@@ -1630,6 +1798,7 @@ def render_settings() -> tuple[str, InlineKeyboardMarkup]:
         [_toggle("nl", "Don't log queries", s["no_log"])],
         [_toggle("mem", "Members search", s["members_can_search"]), _toggle("raw", "Group raw JSON", s["group_raw"])],
         [_toggle("lock", "Lockdown mode", s["lockdown"], danger_when_on=True)],
+        [_toggle("ri", "Rich UI (Bot API 10.3)", s["rich_ui"]), btn("🧪 Test rich UI", "adm|richtest|0", "success")],
         ADMIN_BACK,
     ]
     return text, rich_buttons(rows)
@@ -1812,7 +1981,14 @@ async def run_search(query: str, name: str | None = None) -> SearchResult:
         payload = await _fetch(build_url(query, backup), headers, name)
 
     elapsed = int((time.perf_counter() - started) * 1000)
-    items, meta = extract_items(payload)
+    prof = profile(name)
+    if not eff(prof, "no_log"):  # keep the last raw response so the response editor can show a real preview
+        try:
+            if len(json.dumps(payload, default=str)) < 300_000:
+                SAMPLES[name or "num"] = payload
+        except (TypeError, ValueError):
+            pass
+    items, meta, payload = apply_xform(payload, prof)
     meta.pop("q", None)
     return SearchResult(query=query, items=items, meta=meta, raw=payload, elapsed_ms=elapsed, source=name)
 
@@ -1873,8 +2049,15 @@ def uid_of(update: Update) -> int:
 
 
 async def send_menu(update: Update) -> None:
-    text, markup = render_menu(uid_of(update))
-    await update.effective_message.reply_html(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
+    uid = uid_of(update)
+    text, markup = render_menu(uid)
+    msg = update.effective_message
+    if rich_enabled():
+        extra = link_rows()
+        mk = InlineKeyboardMarkup(list(markup.inline_keyboard) + extra) if extra else markup
+        if await send_rich(msg.get_bot(), msg.chat_id, rich_menu_html(uid), mk, reply_to=msg.message_id) is not None:
+            return
+    await msg.reply_html(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
 
 
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1984,7 +2167,7 @@ async def do_search(update: Update, query: str, force_cards: bool = False,
         )
         clean(note)
         record_activity(user, chat, query, 0, 0, "blocked", source, hide_query=True)
-        await strike(bot, user, "protected query", 3)
+        await strike(bot, user, "protected query", 3, chat=chat, message=message)
         return
 
     cap = int((gmeta or {}).get("cap") or 0) if not admin else 0
@@ -2002,7 +2185,7 @@ async def do_search(update: Update, query: str, force_cards: bool = False,
     blocked = quota_check(user_id, source)
     if blocked:
         await message.reply_html(blocked)
-        await strike(bot, user, "rate limit", 1)
+        await strike(bot, user, "rate limit", 1, chat=chat, message=message)
         return
     if cap:
         USAGE[(chat.id, "__grp")] = (gday, gcount + 1)
@@ -2051,7 +2234,7 @@ async def do_search(update: Update, query: str, force_cards: bool = False,
     src_stat(source, hits=len(result.items), ms=result.elapsed_ms)
     if source is None and not nolog:
         remember(user_id, query)
-    record_activity(user, chat, query, len(result.items), result.elapsed_ms, "ok", source, nolog)
+    record_activity(user, chat, query, len(result.items), result.elapsed_ms, "ok", source, nolog, result=result)
 
     if not result.items:
         await placeholder.edit_text(
@@ -2076,6 +2259,17 @@ async def do_search(update: Update, query: str, force_cards: bool = False,
     if delay:
         spawn(_forget_later(key, delay + 5))
     text, markup = render_results(key, result, 0)
+    if rich_enabled():  # native Rich Message (tables, collapsible sections); the placeholder is replaced
+        sent = await send_rich(bot, placeholder.chat_id, rich_results_html(key, result, 0), markup,
+                               reply_to=message.message_id)
+        if sent is not None:
+            if delay:
+                autodelete(bot, sent, delay=delay)
+            try:
+                await placeholder.delete()
+            except TelegramError:
+                pass
+            return
     await placeholder.edit_text(
         text, parse_mode=ParseMode.HTML, reply_markup=markup, link_preview_options=NO_PREVIEW
     )
@@ -2261,6 +2455,9 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             args.pop(0)
     reason = " ".join(args)
     ban_user(target, minutes, reason, user.id)
+    in_group = update.effective_chat.type in GROUP_TYPES
+    await tell_user(context.bot, target, update.effective_chat.id if in_group else None, ban_text(target),
+                    reply.message_id if (reply and in_group) else None)
     await update.effective_message.reply_html(
         f"🚫 <b>Banned</b> <code>{target}</code> · {fmt_minutes(minutes)}" + (f"\n📝 {esc(reason)}" if reason else "")
     )
@@ -2275,6 +2472,7 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     target = int(context.args[0])
     unban_user(target)
+    await tell_user(context.bot, target, None, "✅ <b>You have been unbanned.</b> You can use the bot again - please follow the usage rules.")
     await update.effective_message.reply_html(f"✅ <b>Unbanned</b> <code>{target}</code>")
 
 
@@ -2286,6 +2484,9 @@ async def cmd_banned(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ev = update.my_chat_member
     chat, adder = ev.chat, ev.from_user
+    if chat.type == ChatType.CHANNEL:
+        await handle_channel_membership(ev, context)
+        return
     if chat.type not in GROUP_TYPES:
         return
     old, new = ev.old_chat_member.status, ev.new_chat_member.status
@@ -2380,6 +2581,9 @@ ADMIN_COMMANDS = [
     BotCommand("grant", "Give a user unlimited / custom limits"),
     BotCommand("revoke", "Remove a user's grants"),
     BotCommand("grants", "List all grants"),
+    BotCommand("user", "Look up a user: used the bot? history, export"),
+    BotCommand("setlog", "Connect / disconnect the log channel"),
+    BotCommand("commands", "Show all commands and how to use them"),
     BotCommand("groups", "Manage groups"),
     BotCommand("allowgroup", "Authorize a group"),
     BotCommand("denygroup", "Revoke a group"),
@@ -2404,7 +2608,8 @@ async def refresh_commands(bot) -> None:
     try:
         await bot.delete_my_commands()
         group_cmds = [BotCommand("num", "Run an OSINT lookup"),
-                      BotCommand("optout", "Ask for a number/username to be protected")] + custom
+                      BotCommand("optout", "Ask for a number/username to be protected"),
+                      BotCommand("commands", "Show all commands and how to use them")] + custom
         await bot.set_my_commands(group_cmds, scope=BotCommandScopeAllGroupChats())
         await bot.set_my_commands(group_cmds, scope=BotCommandScopeAllChatAdministrators())
     except TelegramError as exc:
@@ -2557,6 +2762,8 @@ def render_cmd_panel(name: str) -> tuple[str, InlineKeyboardMarkup]:
             f"🔑 <b>Headers</b> ▸ <code>{headers}</code>",
             f"⏱ <b>Limits</b> ▸ <code>{esc(limits_summary(s))}</code>",
             f"🛡 <b>Blocked</b> ▸ <code>{len(s.get('blocked') or [])}</code>",
+            f"💡 <b>Example</b> ▸ <code>{esc('/' + name + ' ' + (s.get('example') or '<query>'))}</code>",
+            f"🎛 <b>Response rules</b> ▸ <code>{esc(xf_summary(s.get('xform') or {}))}</code>",
             f"📈 <b>Stats</b> ▸ <code>{esc(src_stats_line(name))}</code>",
             f"🛟 <b>Backup API</b> ▸ <code>{esc('set · ' + host_of(s['backup_url'])) if s.get('backup_url') else 'none'}</code>",
             f"🧯 <b>Breaker</b> ▸ <code>{esc(breaker_text(name))}</code>",
@@ -2577,6 +2784,7 @@ def render_cmd_panel(name: str) -> tuple[str, InlineKeyboardMarkup]:
              "danger" if maint_active(s) else "primary"),
          btn("💬 Maint. message", f"cx|{n}.maintmsg|0")],
         [btn("🛟 Backup API", f"cx|{n}.backup|0"), btn("🧯 Reset breaker", f"cx|{n}.brk|0")],
+        [btn("🎛 Response editor", f"xf|{n}.panel|0", "success"), btn("💡 Usage example", f"cx|{n}.example|0")],
         [btn("🧪 Test", f"cx|{n}.test|0", "success"),
          btn("⚪ Disable" if s.get("enabled") else "🟢 Enable", f"cx|{n}.toggle|0",
              "primary" if s.get("enabled") else "success")],
@@ -2600,6 +2808,7 @@ PROMPTS = {
     "test": "🧪 <b>Test</b>\nSend a sample query and I'll run it through this command.",
     "gblock": "🛡 <b>Protect queries</b>\nSend phone numbers, usernames or emails to protect, one per line. Nobody can look them up on ANY command.\n<i>Your message is deleted instantly.</i>",
     "blkadd": "🛡 <b>Block queries (this command only)</b>\nSend queries to block, one per line.\n<i>Your message is deleted instantly.</i>",
+    "example": "💡 <b>Usage example</b>\nSend an example query shown to members, e.g. <code>9377695005</code> or <code>GJ01AB1234</code>, or <code>clear</code>.",
     "maintmsg": "💬 <b>Maintenance message</b>\nSend the text users see while this command is in maintenance, or <code>clear</code>.",
     "backup": "🛟 <b>Backup API</b>\nSend a backup URL (with <code>{q}</code>). It is used automatically when the main API fails. Send <code>clear</code> to remove.\n<i>Your message is deleted instantly.</i>",
 }
@@ -2619,6 +2828,14 @@ def _prompt_markup_for(st: dict[str, Any]) -> InlineKeyboardMarkup:
         return prompt_markup(name, "cfg") if name else prompt_markup(None, "cancelset")
     if op in GRANT_PROMPTS:
         return rich_buttons([[btn("✖️ Cancel", "gr|build|0", "danger")]])
+    if op == "xf":
+        return rich_buttons([[btn("✖️ Cancel", f"xf|{name}.panel|0", "danger")]])
+    if op == "logchan":
+        return rich_buttons([[btn("✖️ Cancel", "adm|logchan|0", "danger")]])
+    if op == "welcometext":
+        return rich_buttons([[btn("✖️ Cancel", "adm|welcome|0", "danger")]])
+    if op == "userq":
+        return rich_buttons([[btn("✖️ Cancel", "adm|home|0", "danger")]])
     return prompt_markup(name)
 
 
@@ -2628,6 +2845,14 @@ def prompt_text_for(st: dict[str, Any]) -> str:
         return val_prompt(st["field"], st.get("cmd"))
     if op in GRANT_PROMPTS:
         return GRANT_PROMPTS[op]
+    if op == "xf":
+        return XF_PROMPTS[st["field"]]
+    if op == "logchan":
+        return LOG_PROMPT
+    if op == "welcometext":
+        return WELCOME_PROMPT
+    if op == "userq":
+        return USER_PROMPT
     return PROMPTS.get(op, "")
 
 
@@ -2641,6 +2866,14 @@ def _back_view(st: dict[str, Any]) -> tuple[str, InlineKeyboardMarkup]:
         return render_cmd_cfg(name) if name in SOURCES else (render_settings() if name is None else render_cmd_list())
     if op in GRANT_PROMPTS:
         return render_grant_builder(st.get("admin", 0))
+    if op == "xf":
+        return render_xf_panel(name)
+    if op == "logchan":
+        return render_logchan()
+    if op == "welcometext":
+        return render_welcome()
+    if op == "userq":
+        return render_admin()
     return _panel_or_list(name)
 
 
@@ -2737,6 +2970,68 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
             src["maint_until"] = time.time() + val if val > 0 else 0.0
         else:
             src[field] = val
+    elif op == "logchan":
+        if text.lower() in {"off", "none", "0"}:
+            SETTINGS["log_channel"] = 0
+        elif text.lstrip("-").isdigit():
+            good, info = await set_log_channel(context.bot, int(text))
+            if not good:
+                err = f"I couldn't post there: <code>{esc(info)}</code>\nAdd the bot to the channel as an <b>admin with “Post messages”</b>, then try again."
+        else:
+            err = "Send the channel's numeric ID (it starts with <code>-100</code>) or <code>off</code>."
+    elif op == "welcometext":
+        SETTINGS["welcome_text"] = "" if text.lower() == "clear" else shorten(text, 600)
+    elif op == "userq":
+        INPUT.pop(uid, None)
+        await show_user_profile(context, text, st)
+        return True
+    elif op == "xf":
+        xcfg, _p = xf_target(name)
+        if xcfg is None:
+            INPUT.pop(uid, None)
+            await _show(context, st, *render_cmd_list())
+            return True
+        field, low = st["field"], text.lower()
+        if field in {"rm", "only", "scr"}:
+            key = {"rm": "remove", "only": "only", "scr": "scrub"}[field]
+            if low == "clear":
+                xcfg[key] = []
+            else:
+                vals = [v.strip() for v in re.split(r"[\n,;]+", text) if v.strip()]
+                if key != "scrub":
+                    vals = [v.lower() for v in vals]
+                if not vals:
+                    err = "Send at least one value."
+                elif key == "only":  # order matters, so this one replaces
+                    xcfg[key] = list(dict.fromkeys(vals))[:60]
+                else:
+                    xcfg[key] = list(dict.fromkeys((xcfg.get(key) or []) + vals))[:100]
+        elif field in {"ren", "ext"}:
+            key = {"ren": "rename", "ext": "extra"}[field]
+            if low == "clear":
+                xcfg[key] = {}
+            else:
+                found = {}
+                for part in re.split(r"[\n;]+", text):
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        if k.strip() and v.strip():
+                            found[k.strip().lower() if key == "rename" else k.strip()] = v.strip()[:80]
+                if not found:
+                    err = "Use <code>key=value</code>, one per line."
+                else:
+                    xcfg[key] = {**(xcfg.get(key) or {}), **found}
+        elif field == "path":
+            xcfg["path"] = "" if low in {"clear", "auto"} else text.strip()[:120]
+        elif field == "sample":
+            try:
+                parsed = json.loads(text)
+                if not isinstance(parsed, (dict, list)):
+                    raise ValueError
+            except ValueError:
+                err = "That isn't valid JSON (send an object or a list)."
+            else:
+                SAMPLES[name] = parsed
     elif op in GRANT_PROMPTS:
         st["admin"] = uid
         d = GRANT_DRAFT.setdefault(uid, new_draft())
@@ -2773,6 +3068,8 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
             err = "Send at least one query (3+ characters), one per line."
         else:
             src["blocked"] = list(dict.fromkeys((src.get("blocked") or []) + norms))[:500]
+    elif op == "example":
+        src["example"] = "" if text.lower() == "clear" else shorten(text, 60)
     elif op == "maintmsg":
         src["maint_msg"] = "" if text.lower() == "clear" else shorten(text, 200)
     elif op == "backup":
@@ -3156,14 +3453,85 @@ def is_banned(uid: int) -> bool:
 def ban_user(uid: int, minutes: int = 0, reason: str = "", by: int = 0) -> None:
     BANNED.add(uid)
     BAN_INFO[uid] = {"until": time.time() + minutes * 60 if minutes else 0.0, "reason": reason[:120], "by": by}
+    rec = USERS.get(uid)
+    if rec is not None:
+        rec["bans"] += 1
+        USERS_DIRTY.add(uid)
     persist()
+    logchan("mod", f"🚫 <b>BAN</b>\n{DIV}\n{user_html(uid, uname(uid), (rec or {}).get('username'))}\n"
+                   f"⏱ {fmt_minutes(minutes)} · 📝 {esc(reason or 'not specified')}\n"
+                   f"👮 {'automatic' if not by else user_html(by, uname(by))}\n🕒 {when()}")
 
 
 def unban_user(uid: int) -> None:
+    was = uid in BANNED
     BANNED.discard(uid)
     BAN_INFO.pop(uid, None)
     STRIKES.pop(uid, None)
+    WARNED.pop(uid, None)
     persist()
+    if was:
+        logchan("mod", f"✅ <b>UNBAN</b>\n{DIV}\n{user_html(uid, uname(uid), (USERS.get(uid) or {}).get('username'))}\n🕒 {when()}")
+
+
+def ban_text(uid: int) -> str:
+    info = BAN_INFO.get(uid) or {}
+    until = info.get("until") or 0
+    return (
+        f"🚫 <b>You are banned from this bot</b>\n{DIV}\n"
+        + block_table([
+            ("⏱ Time left", "permanent" if not until else fmt_left(until - time.time())),
+            ("📝 Reason", info.get("reason") or "not specified"),
+        ])
+        + "\n\n<i>If you think this is a mistake, please contact an admin.</i>"
+    )
+
+
+async def tell_user(bot, uid: int, chat_id: int | None, text: str, reply_to: int | None = None, delay: float = 45) -> None:
+    """Tell a user something important: reply where it happened (auto-deletes) and DM best-effort."""
+    if chat_id and chat_id != uid:
+        try:
+            sent = await bot.send_message(
+                chat_id, text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW,
+                reply_parameters=ReplyParameters(reply_to, allow_sending_without_reply=True) if reply_to else None,
+            )
+            autodelete(bot, sent, delay=delay)
+        except TelegramError:
+            pass
+    try:  # the bot can only DM people who have started it; failure is normal
+        await bot.send_message(uid, text, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW)
+    except TelegramError:
+        pass
+
+
+async def banned_notice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Banned users are answered (throttled) instead of being silently ignored."""
+    if not SETTINGS["ban_notice"]:
+        return
+    user = update.effective_user
+    now = time.time()
+    if now - BAN_NOTICE.get(user.id, 0) < 30:
+        return
+    BAN_NOTICE[user.id] = now
+    info = BAN_INFO.get(user.id) or {}
+    until = info.get("until") or 0
+    if update.callback_query:
+        try:
+            await update.callback_query.answer(
+                f"🚫 You are banned ({'permanent' if not until else fmt_left(until - now) + ' left'}). "
+                f"Reason: {info.get('reason') or 'not specified'}"[:190], show_alert=True)
+        except TelegramError:
+            pass
+        return
+    msg = update.effective_message
+    try:
+        sent = await context.bot.send_message(
+            update.effective_chat.id, ban_text(user.id), parse_mode=ParseMode.HTML,
+            reply_parameters=ReplyParameters(msg.message_id, allow_sending_without_reply=True),
+        )
+        autodelete(context.bot, sent, delay=30)
+    except TelegramError:
+        pass
 
 
 def maint_active(src: dict[str, Any]) -> bool:
@@ -3228,32 +3596,62 @@ def cmd_stats_block() -> str:
     return "\n\n📊 <b>BY COMMAND</b>\n" + tree(rows)
 
 
-async def strike(bot, user, why: str, weight: int = 1) -> bool:
-    """Abuse guard: too many violations in 10 minutes -> automatic temporary ban + admin alert."""
+async def strike(bot, user, why: str, weight: int = 1, chat: Any = None, message: Any = None) -> bool:
+    """Abuse guard: warn twice, then ban automatically - the user is told every time."""
     if user is None or not SETTINGS["abuse_guard"] or is_admin(user.id):
         return False
     now = time.time()
+    limit = int(SETTINGS["strike_limit"])
+    w1 = max(1, math.ceil(limit * 0.5))
+    w2 = max(w1 + 1, math.ceil(limit * 0.8))
+    levels = [t for t in (w1, w2) if t < limit]
     dq = STRIKES.setdefault(user.id, deque(maxlen=200))
-    for _ in range(weight):
-        dq.append(now)
     while dq and now - dq[0] > 600:
         dq.popleft()
-    if len(dq) < int(SETTINGS["strike_limit"]):
-        return False
-    STRIKES.pop(user.id, None)
+    if len(dq) < w1:
+        WARNED.pop(user.id, None)
+    for _ in range(weight):
+        dq.append(now)
+    count = len(dq)
+    cid = chat.id if chat is not None else None
+    rid = message.message_id if message is not None else None
     minutes = int(SETTINGS["ban_minutes"])
-    ban_user(user.id, minutes, f"auto: {why}", 0)
-    await notify_admins(
-        bot,
-        f"🚨 <b>AUTO-BAN</b>\n{DIV}\n"
-        + block_table([
-            ("👤 User", f"{user.full_name} ({user.id})"),
-            ("⏱ Duration", fmt_minutes(minutes)),
-            ("📝 Reason", why),
-        ]),
-        rich_buttons([[btn("✅ Unban", f"ub|{user.id}|0", "success")]]),
-    )
-    return True
+
+    if count >= limit:
+        STRIKES.pop(user.id, None)
+        WARNED.pop(user.id, None)
+        ban_user(user.id, minutes, f"auto: {why}", 0)
+        await tell_user(bot, user.id, cid, ban_text(user.id), rid)
+        await notify_admins(
+            bot,
+            f"🚨 <b>AUTO-BAN</b>\n{DIV}\n"
+            + block_table([
+                ("👤 User", f"{user.full_name} ({user.id})"),
+                ("⏱ Duration", fmt_minutes(minutes)),
+                ("📝 Reason", why),
+            ]),
+            rich_buttons([[btn("✅ Unban", f"ub|{user.id}|0", "success")]]),
+        )
+        return True
+
+    lvl = sum(1 for t in levels if count >= t)
+    if lvl > WARNED.get(user.id, 0):
+        WARNED[user.id] = lvl
+        rec = USERS.get(user.id)
+        if rec is not None:
+            rec["warns"] += 1
+            USERS_DIRTY.add(user.id)
+        await tell_user(
+            bot, user.id, cid,
+            f"⚠️ <b>Warning {lvl}/{len(levels)}</b>\n{DIV}\n"
+            f"{esc(display_name(user))}, you triggered the abuse guard (<i>{esc(why)}</i>).\n"
+            f"Keep going and you will be <b>banned for {fmt_minutes(minutes)}</b>.\n\n"
+            "<i>Slow down and follow the usage rules.</i>",
+            rid,
+        )
+        logchan("mod", f"⚠️ <b>WARNING {lvl}/{len(levels)}</b>\n{DIV}\n{user_html(user.id, user.full_name or '?', getattr(user, 'username', None))}\n"
+                       f"📝 {esc(why)} · strikes {count}/{limit}\n🕒 {when()}")
+    return False
 
 
 async def breaker_fail(bot, name: str | None) -> None:
@@ -3344,6 +3742,9 @@ def render_group_view(gid: int) -> tuple[str, InlineKeyboardMarkup]:
     ]
     for i in range(0, len(toggles), 2):
         rows.append(toggles[i : i + 2])
+    wel = meta.get("welcome")
+    rows.append([btn(f"👋 Welcome here: {'global' if wel is None else ('ON' if wel else 'off')}", f"adm|gwel_{gid}|0",
+                     "primary" if wel is None else ("success" if wel else "danger"))])
     rows.append([btn("🚪 Leave", f"lg|{gid}|0", "danger"), btn("⬅️ Groups", "adm|groups|0")])
     return text, rich_buttons(rows)
 
@@ -3560,6 +3961,8 @@ async def housekeeping_tick(bot) -> None:
         BANNED.discard(uid)
         BAN_INFO.pop(uid, None)
         changed = True
+        await tell_user(bot, uid, None, "✅ <b>Your temporary ban has ended.</b> You can use the bot again.")
+        logchan("mod", f"⏳ <b>BAN ENDED</b>\n{DIV}\n{user_html(uid, uname(uid))}\n🕒 {when()}")
     for key in [k for k, g in GRANTS.items() if g.get("until") and now >= g["until"]]:
         GRANTS.pop(key, None)  # timed grants end by themselves
         changed = True
@@ -3573,9 +3976,12 @@ async def housekeeping_tick(bot) -> None:
     today = today_utc()
     for k in [k for k in OPTOUT_COUNT if k[1] != today]:
         OPTOUT_COUNT.pop(k, None)
+    for uid in [u for u in WARNED if u not in STRIKES]:
+        WARNED.pop(uid, None)
     if changed:
         persist()
         await refresh_commands(bot)
+    await flush_users()
     await maybe_digest(bot)
 
 
@@ -3673,6 +4079,8 @@ def grant_scope_key(tok: str) -> str | None:
 def set_grant(uid: int, cmd: str, limit: int, secs: int, by: int) -> None:
     GRANTS[(uid, cmd)] = {"limit": int(limit), "until": time.time() + secs if secs else 0.0, "by": by}
     persist()
+    alog(by, f"🎁 Grant → {user_html(uid, uname(uid))}\n🧩 {esc(grant_label(cmd))} · {'unlimited' if not limit else str(limit) + '/day'} · "
+             f"{fmt_left(secs) if secs else 'no end'}")
 
 
 def grant_line(uid: int, cmd: str, g: dict[str, Any]) -> str:
@@ -3823,11 +4231,1180 @@ async def cmd_grants(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Response editor - control exactly what users see from each API               #
+# --------------------------------------------------------------------------- #
+
+XF_PROMPTS = {
+    "rm": "🧹 <b>Remove fields</b>\nSend field names to delete from every response, comma or line separated. Wildcards work and they match at any depth:\n<code>developer, req_*, expiry, cached, response_time</code>\nUse a dotted path for one spot only: <code>data.apiMessage</code>.\nSend <code>clear</code> to un-remove everything.",
+    "only": "🎯 <b>Only show these fields</b>\nSend the record fields to keep, in the order you want them (others are dropped):\n<code>regNo, stateName, officeName, regnUpto</code>\nSend <code>clear</code> to show all fields again.",
+    "ren": "🏷 <b>Rename fields</b>\nOne per line as <code>field=New label</code>:\n<code>regNo=Registration No</code>\n<code>officeName=RTO Office</code>\nSend <code>clear</code> to reset.",
+    "scr": "✂️ <b>Scrub text</b>\nSend phrases to cut out of every text value (case-insensitive), e.g. branding:\n<code>@simpleguy444, Powered by X</code>\nSend <code>clear</code> to reset.",
+    "ext": "➕ <b>Extra fields</b>\nAdd your own fields to every record, one per line as <code>key=value</code>:\n<code>Source=@MyBot</code>\nSend <code>clear</code> to reset.",
+    "path": "📍 <b>Records path</b>\nWhere the list of records lives in the response, as a dotted path - for example <code>data.data</code>.\nSend <code>auto</code> to let the bot detect it.",
+    "sample": "📋 <b>Paste a sample</b>\nPaste a raw API response (JSON, up to ~4000 characters) to design the rules against. Real lookups are captured automatically too.",
+}
+XF_OPS = {"rm", "only", "ren", "scr", "ext", "path", "sample"}
+
+
+def xf_of(p: dict[str, Any]) -> dict[str, Any]:
+    return {**XFORM_DEFAULTS, **(p.get("xform") or {})}
+
+
+def xf_target(name: str | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if name == "num":
+        return DEFAULT_XFORM, DEFAULT_PROFILE
+    src = SOURCES.get(name or "")
+    if src is None:
+        return None, None
+    return src.setdefault("xform", {}), src
+
+
+def xf_summary(xf: dict[str, Any]) -> str:
+    bits = []
+    for key, label in (("remove", "remove"), ("only", "only"), ("rename", "rename"), ("scrub", "scrub"), ("extra", "extra")):
+        if xf.get(key):
+            bits.append(f"{label} {len(xf[key])}")
+    if xf.get("path"):
+        bits.append(f"path {xf['path']}")
+    if xf.get("meta") is False:
+        bits.append("meta hidden")
+    return " · ".join(bits) or "none (raw)"
+
+
+def _pat_hit(path: str, key: str, pats: list[str]) -> bool:
+    k, pl = key.lower(), path.lower()
+    return any(fnmatch.fnmatchcase(k, pat) or fnmatch.fnmatchcase(pl, pat) for pat in pats)
+
+
+def deep_clean(obj: Any, pats: list[str], path: str = "") -> Any:
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            sub = f"{path}.{k}" if path else str(k)
+            if _pat_hit(sub, str(k), pats):
+                continue
+            out[k] = deep_clean(v, pats, sub)
+        return out
+    if isinstance(obj, list):
+        return [deep_clean(v, pats, path) for v in obj]
+    return obj
+
+
+def deep_scrub(obj: Any, rx: re.Pattern[str]) -> Any:
+    if isinstance(obj, dict):
+        return {k: deep_scrub(v, rx) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [deep_scrub(v, rx) for v in obj]
+    if isinstance(obj, str):
+        return re.sub(r"\s{2,}", " ", rx.sub("", obj)).strip()
+    return obj
+
+
+def deep_rename(obj: Any, mapping: dict[str, str]) -> Any:
+    if isinstance(obj, dict):
+        return {mapping.get(str(k).lower(), k): deep_rename(v, mapping) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [deep_rename(v, mapping) for v in obj]
+    return obj
+
+
+def dig(obj: Any, path: str) -> Any:
+    cur = obj
+    for part in path.split("."):
+        if isinstance(cur, dict):
+            real = next((k for k in cur if str(k).lower() == part.lower()), None)
+            if real is None:
+                return None
+            cur = cur[real]
+        elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+            cur = cur[int(part)]
+        else:
+            return None
+    return cur
+
+
+def apply_xform(payload: Any, p: dict[str, Any]) -> tuple[list[Any], dict[str, Any], Any]:
+    """Apply a command's response rules. Order: remove -> scrub -> locate records -> only -> rename -> extra."""
+    xf = xf_of(p)
+    data = payload
+    pats = [x.lower() for x in xf["remove"]]
+    if pats:
+        data = deep_clean(data, pats)
+    if xf["scrub"]:
+        data = deep_scrub(data, re.compile("|".join(re.escape(x) for x in xf["scrub"]), re.I))
+    items, meta = extract_items(data)
+    if xf["path"]:
+        got = dig(data, xf["path"])
+        if isinstance(got, list):
+            items = got
+        elif isinstance(got, dict):
+            items = [got]
+        meta = {k: v for k, v in data.items() if is_scalar(v) and v not in (None, "")} if isinstance(data, dict) else {}
+    only = [x.lower() for x in xf["only"]]
+    if only:
+        shaped = []
+        for it in items:
+            if isinstance(it, dict):
+                lower = {str(k).lower(): k for k in it}
+                it = {lower[o]: it[lower[o]] for o in only if o in lower}
+            shaped.append(it)
+        items = shaped
+    ren = {k.lower(): v for k, v in xf["rename"].items()}
+    if ren:
+        items = deep_rename(items, ren)
+        meta = {ren.get(str(k).lower(), k): v for k, v in meta.items()}
+        data = deep_rename(data, ren)
+    if xf["extra"]:
+        items = [{**it, **xf["extra"]} if isinstance(it, dict) else it for it in items]
+    return items, meta, data
+
+
+def list_paths(obj: Any, prefix: str = "", out: list[tuple[str, Any]] | None = None, depth: int = 0) -> list[tuple[str, Any]]:
+    out = [] if out is None else out
+    if len(out) >= 70 or depth > 6:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}.{k}" if prefix else str(k)
+            if is_scalar(v):
+                out.append((path, v))
+            else:
+                list_paths(v, path, out, depth + 1)
+    elif isinstance(obj, list) and obj:
+        out.append((prefix, f"[list of {len(obj)}]"))
+        list_paths(obj[0], prefix, out, depth + 1)
+    return out
+
+
+def render_xf_panel(name: str) -> tuple[str, InlineKeyboardMarkup]:
+    xcfg, _p = xf_target(name)
+    if xcfg is None:
+        return render_cmd_list()
+    xf = {**XFORM_DEFAULTS, **xcfg}
+    label = "/num (default)" if name == "num" else f"/{name}"
+    sample = SAMPLES.get(name)
+
+    def cut(v: Any) -> str:
+        return shorten(", ".join(v) if isinstance(v, list) else ", ".join(f"{k}={x}" for k, x in v.items()), 70) or "none"
+
+    text = (
+        f"🎛 <b>RESPONSE EDITOR</b> · <b>{esc(label)}</b>\n{DIV}\n"
+        + tree([
+            f"🧹 <b>Removed</b> ▸ <code>{esc(cut(xf['remove']))}</code>",
+            f"🎯 <b>Only show</b> ▸ <code>{esc(cut(xf['only']))}</code>",
+            f"🏷 <b>Renamed</b> ▸ <code>{esc(cut(xf['rename']))}</code>",
+            f"✂️ <b>Scrubbed</b> ▸ <code>{esc(cut(xf['scrub']))}</code>",
+            f"➕ <b>Extra</b> ▸ <code>{esc(cut(xf['extra']))}</code>",
+            f"📍 <b>Records path</b> ▸ <code>{esc(xf['path'] or 'auto')}</code>",
+            f"👁 <b>API meta in header</b> ▸ <code>{'shown' if xf['meta'] else 'hidden'}</code>",
+            f"🧪 <b>Sample</b> ▸ <code>{'captured ✔' if sample is not None else 'none yet - run a lookup or paste one'}</code>",
+        ])
+        + "\n\n<i>Rules apply to what users see, their exports and the group JSON. Use 🔍 Explore to see field names, 🧪 Preview to check the result.</i>"
+    )
+    n = name
+    back = ADMIN_BACK[0] if name == "num" else btn("⬅️ Command", f"cx|{n}.view|0")
+    rows = [
+        [btn("🧹 Remove fields", f"xf|{n}.rm|0"), btn("🎯 Only show", f"xf|{n}.only|0")],
+        [btn("🏷 Rename", f"xf|{n}.ren|0"), btn("✂️ Scrub text", f"xf|{n}.scr|0")],
+        [btn("➕ Extra fields", f"xf|{n}.ext|0"), btn("📍 Records path", f"xf|{n}.path|0")],
+        [btn("👁 API meta: shown" if xf["meta"] else "👁 API meta: hidden", f"xf|{n}.meta|0", "success" if xf["meta"] else "danger")],
+        [btn("🔍 Explore fields", f"xf|{n}.explore|0", "success"), btn("🧪 Preview", f"xf|{n}.preview|0", "success")],
+        [btn("📋 Paste sample", f"xf|{n}.sample|0"), btn("🧼 Reset all", f"xf|{n}.reset|0", "danger")],
+        [back],
+    ]
+    return text, rich_buttons(rows)
+
+
+def render_xf_explore(name: str) -> tuple[str, InlineKeyboardMarkup]:
+    sample = SAMPLES.get(name)
+    back = rich_buttons([[btn("⬅️ Editor", f"xf|{name}.panel|0")]])
+    if sample is None:
+        return "🔍 <b>No sample yet.</b>\nRun a lookup with this command, or tap 📋 Paste sample.", back
+    rows = list_paths(sample)
+    body = "\n".join(f"<code>{esc(path)}</code> ▸ {esc(shorten(v, 28))}" for path, v in rows) or "<i>Empty response.</i>"
+    return (
+        f"🔍 <b>FIELDS IN THE LAST RESPONSE</b>\n{DIV}\n{body}\n\n"
+        "<i>Use these names in Remove / Only show / Rename. Dotted paths hit one exact spot; a plain name matches everywhere.</i>",
+        back,
+    )
+
+
+def render_xf_preview(name: str) -> tuple[str, InlineKeyboardMarkup]:
+    sample = SAMPLES.get(name)
+    back = rich_buttons([[btn("⬅️ Editor", f"xf|{name}.panel|0")]])
+    if sample is None:
+        return "🧪 <b>No sample yet.</b>\nRun a lookup with this command, or tap 📋 Paste sample.", back
+    xcfg, prof = xf_target(name)
+    items, meta, data = apply_xform(sample, prof)
+    xf = {**XFORM_DEFAULTS, **(xcfg or {})}
+    shown_meta = (" · ".join(f"{humanize_key(k)}: {format_scalar(v)}" for k, v in list(meta.items())[:3])
+                  if xf["meta"] and meta else "-")
+    card = render_card(items[0], 0, 10, 150, prof) if items else "<i>No records found - check the Records path.</i>"
+    warn = ("\n⚠️ <b>Records path not found</b> in this response - users still get auto-detected records.\n"
+            if xf["path"] and dig(sample, xf["path"]) is None else "")
+    raw = json.dumps(masked_copy(data, hide=prof.get("hide") or []), indent=2, ensure_ascii=False, default=str)
+    snippet = raw[:1100] + ("\n…" if len(raw) > 1100 else "")
+    text = (
+        f"🧪 <b>PREVIEW</b> · {'/num' if name == 'num' else '/' + esc(name)}\n{DIV}\n"
+        f"📦 Records: <code>{len(items)}</code>\nℹ️ Header meta: <code>{esc(shorten(shown_meta, 120))}</code>\n{warn}\n"
+        f"{card}\n\n🧾 <b>JSON users get</b>\n{block_expandable_quote(block_code(snippet))}"
+    )
+    if len(text) > MAX_MESSAGE:
+        text = text[:MAX_MESSAGE - 30].rsplit("\n", 1)[0] + "\n…</pre></blockquote>"
+    return text, back
+
+
+async def handle_xf(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
+    query = update.callback_query
+    uid = query.from_user.id
+    name, _, op = key.partition(".")
+    INPUT.pop(uid, None)
+    xcfg, _p = xf_target(name)
+    if xcfg is None:
+        await query.answer("That command no longer exists.", show_alert=True)
+        await _safe_edit(query, *render_cmd_list())
+        return
+    if op == "panel":
+        await query.answer()
+    elif op == "meta":
+        xcfg["meta"] = not xcfg.get("meta", True)
+        persist()
+        QUERY_CACHE.clear()
+        await query.answer("API meta shown" if xcfg["meta"] else "API meta hidden")
+    elif op in XF_OPS:
+        await query.answer()
+        INPUT[uid] = {"op": "xf", "cmd": name, "field": op, "chat": query.message.chat_id,
+                      "mid": query.message.message_id, "ts": time.time()}
+        await _safe_edit(query, XF_PROMPTS[op], rich_buttons([[btn("✖️ Cancel", f"xf|{name}.panel|0", "danger")]]))
+        return
+    elif op == "explore":
+        await query.answer()
+        await _safe_edit(query, *render_xf_explore(name))
+        return
+    elif op == "preview":
+        await query.answer()
+        await _safe_edit(query, *render_xf_preview(name))
+        return
+    elif op == "reset":
+        await query.answer()
+        await _safe_edit(
+            query, f"🧼 <b>Reset all response rules</b> for {'/num' if name == 'num' else '/' + esc(name)}?",
+            rich_buttons([[btn("🧼 Yes, reset", f"xf|{name}.resetok|0", "danger"), btn("↩️ Keep", f"xf|{name}.panel|0", "success")]]),
+        )
+        return
+    elif op == "resetok":
+        xcfg.clear()
+        persist()
+        QUERY_CACHE.clear()
+        await query.answer("Rules reset")
+    else:
+        await query.answer("Unsupported button.")
+        return
+    await _safe_edit(query, *render_xf_panel(name))
+
+
+# --------------------------------------------------------------------------- #
+# User registry, dossiers and the log channel                                  #
+# --------------------------------------------------------------------------- #
+
+LOG_PROMPT = ("📡 <b>Log channel</b>\nCreate a channel, add this bot as an <b>admin with “Post messages”</b>, then send the "
+              "channel's numeric ID (starts with <code>-100</code>). Send <code>off</code> to disconnect.\n"
+              "<i>Tip: add the bot to the channel as an admin and I'll offer a one-tap “Use as log channel” button.</i>")
+USER_PROMPT = ("👤 <b>Find a user</b>\nSend a Telegram user ID or an @username that has used the bot.\n"
+               "<i>You can also reply to someone's message with /user.</i>")
+
+
+def setting_view(key: str) -> tuple[str, InlineKeyboardMarkup]:
+    if key in SECURITY_KEYS:
+        return render_security()
+    if key in LOG_KEYS:
+        return render_logchan()
+    if key in WELCOME_KEYS:
+        return render_welcome()
+    return render_settings()
+
+
+def _new_rec(user: Any) -> dict[str, Any]:
+    now = time.time()
+    return {"uid": user.id, "name": user.full_name or "?", "username": getattr(user, "username", None) or "",
+            "lang": getattr(user, "language_code", None) or "", "premium": bool(getattr(user, "is_premium", False)),
+            "first": now, "last": now, "count": 0, "by_cmd": {}, "warns": 0, "bans": 0, "groups": {}, "dm": False}
+
+
+async def touch_user(user: Any, chat: Any) -> None:
+    """Every person who reaches the bot gets a persistent record (first/last seen, where, counts)."""
+    rec = USERS.get(user.id)
+    is_new = False
+    if rec is None:
+        stored = None
+        if STORE is not None:
+            try:
+                stored = await STORE.get_user(user.id)
+            except Exception:  # noqa: BLE001
+                stored = None
+        rec = {**_new_rec(user), **stored} if stored else _new_rec(user)
+        is_new = stored is None
+        USERS[user.id] = rec
+    rec["name"] = user.full_name or rec["name"]
+    rec["username"] = getattr(user, "username", None) or ""
+    rec["lang"] = getattr(user, "language_code", None) or rec.get("lang", "")
+    rec["premium"] = bool(getattr(user, "is_premium", False))
+    rec["last"] = time.time()
+    if chat is not None:
+        if chat.type == ChatType.PRIVATE:
+            rec["dm"] = True
+        else:
+            rec["groups"][str(chat.id)] = getattr(chat, "title", None) or str(chat.id)
+    USERS_DIRTY.add(user.id)
+    if is_new:
+        where = "DM" if chat is None or chat.type == ChatType.PRIVATE else f"{chat.title} ({chat.id})"
+        logchan("users", f"🆕 <b>NEW USER</b>\n{DIV}\n{user_html(user.id, rec['name'], rec['username'])}\n"
+                         f"🌐 {esc(rec['lang'] or '?')}{' · ⭐ Premium' if rec['premium'] else ''}\n📍 {esc(where)}\n🕒 {when()}")
+
+
+async def flush_users() -> None:
+    if STORE is None or not USERS_DIRTY:
+        return
+    batch = [dict(USERS[u]) for u in list(USERS_DIRTY) if u in USERS]
+    USERS_DIRTY.clear()
+    try:
+        await STORE.save_users(batch)
+    except Exception as exc:  # noqa: BLE001
+        STORAGE["errors"] += 1
+        USERS_DIRTY.update(r["uid"] for r in batch)
+        log.error("user registry write failed: %s", type(exc).__name__)
+        return
+    if len(USERS) > 5000:  # keep memory bounded: drop the quietest clean records
+        for uid in sorted((u for u in USERS if u not in USERS_DIRTY), key=lambda u: USERS[u]["last"])[: len(USERS) - 3000]:
+            USERS.pop(uid, None)
+
+
+async def find_user(arg: str) -> dict[str, Any] | None:
+    arg = arg.strip()
+    if arg.lstrip("-").isdigit():
+        uid = int(arg)
+        rec = USERS.get(uid)
+        if rec is None and STORE is not None:
+            rec = await STORE.get_user(uid)
+        return rec
+    name = arg.lstrip("@").lower()
+    if not name:
+        return None
+    for rec in USERS.values():
+        if (rec.get("username") or "").lower() == name:
+            return rec
+    return await STORE.find_username(name) if STORE is not None else None
+
+
+def _iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+async def build_dossier(rec: dict[str, Any], limit: int = 500) -> dict[str, Any]:
+    uid = rec["uid"]
+    try:
+        raw = await STORE.user_log(uid, limit) if STORE is not None else []
+    except Exception:  # noqa: BLE001
+        raw = []
+    history = [{
+        "time": _iso(e["ts"]), "ts": e["ts"], "command": e.get("cmd") or "num", "query": e.get("query"),
+        "status": e.get("status"), "hits": e.get("hits"), "ms": e.get("ms"), "where": e.get("where"),
+        "chat_id": e.get("chat_id"), "results": e.get("results"),
+    } for e in raw]
+    today = today_utc()
+    used_today = {c: (USAGE.get((uid, c or "-"), (today, 0))[1] if USAGE.get((uid, c or "-"), (today, 0))[0] == today else 0)
+                  for c in [None] + list(SOURCES)}
+    ban = BAN_INFO.get(uid) if uid in BANNED else None
+    return {
+        "generated_at": _iso(time.time()),
+        "has_used_bot": True,
+        "user": {k: rec.get(k) for k in ("uid", "name", "username", "lang", "premium")},
+        "activity": {"first_seen": _iso(rec["first"]), "last_seen": _iso(rec["last"]), "total_lookups": rec["count"],
+                     "by_command": rec["by_cmd"], "seen_in_groups": rec["groups"], "used_in_dm": rec["dm"],
+                     "lookups_today": {("num" if k is None else k): v for k, v in used_today.items()}},
+        "moderation": {"warnings": rec["warns"], "bans": rec["bans"], "banned_now": is_banned(uid),
+                       "ban": ({**ban, "until_iso": _iso(ban["until"]) if ban.get("until") else None} if ban else None)},
+        "limits": {"daily_override": USER_LIMITS.get(uid),
+                   "grants": [{"command": grant_label(c), **g} for (u, c), g in GRANTS.items() if u == uid]},
+        "history_note": "" if STORE is not None and STORE.kind == "mongo" else
+                        "History is only kept in memory on local-file storage; connect MongoDB for full history with results.",
+        "history_count": len(history),
+        "history": history,
+    }
+
+
+def dossier_txt(d: dict[str, Any]) -> str:
+    u, a, m, lim = d["user"], d["activity"], d["moderation"], d["limits"]
+    out = ["=" * 64, "USER DOSSIER", "=" * 64,
+           "Used the bot      : YES", f"User ID           : {u['uid']}", f"Name              : {u['name']}",
+           f"Username          : {('@' + u['username']) if u['username'] else '-'}",
+           f"Language/Premium  : {u['lang'] or '?'} / {'yes' if u['premium'] else 'no'}",
+           f"First seen        : {a['first_seen']}", f"Last seen         : {a['last_seen']}",
+           f"Total lookups     : {a['total_lookups']}",
+           "By command        : " + (", ".join(f"/{k} x{v}" for k, v in a["by_command"].items()) or "-"),
+           "Seen in           : " + (", ".join(a["seen_in_groups"].values()) + (", DM" if a["used_in_dm"] else "") if a["seen_in_groups"] or a["used_in_dm"] else "-"),
+           "", "MODERATION", "-" * 64,
+           f"Warnings          : {m['warnings']}", f"Bans              : {m['bans']}",
+           f"Banned now        : {'YES' if m['banned_now'] else 'no'}"
+           + (f" (until {m['ban']['until_iso'] or 'permanent'}; reason: {m['ban'].get('reason') or '-'})" if m["ban"] else ""),
+           f"Daily limit override: {lim['daily_override'] if lim['daily_override'] is not None else '-'}",
+           "Grants            : " + ("; ".join(f"{g['command']} -> {'unlimited' if not g['limit'] else str(g['limit']) + '/day'}" for g in lim["grants"]) or "-"),
+           "", f"SEARCH HISTORY ({d['history_count']} entries)", "-" * 64]
+    if d["history_note"]:
+        out.append(f"NOTE: {d['history_note']}")
+    for i, h in enumerate(d["history"], 1):
+        out.append(f"[{i}] {h['time']} | /{h['command']} | {h['where']} | {h['status']} | {h['hits']} hit(s) | {h['ms']} ms")
+        out.append(f"    Query : {h['query']}")
+        res = h.get("results")
+        if res and res.get("items"):
+            for j, item in enumerate(res["items"], 1):
+                out.append(f"    Result {j}:")
+                for k, v in flatten(item if isinstance(item, dict) else {"value": item}):
+                    out.append(f"      {k}: {v}")
+            if res.get("total", 0) > res.get("stored", 0):
+                out.append(f"    (+{res['total'] - res['stored']} more record(s) not stored)")
+        out.append("")
+    return "\n".join(out)
+
+
+def render_user_profile(rec: dict[str, Any], hist: list[dict[str, Any]]) -> tuple[str, InlineKeyboardMarkup]:
+    uid = rec["uid"]
+    banned = is_banned(uid)
+    info = BAN_INFO.get(uid) or {}
+    status = "active"
+    if banned:
+        status = "🚫 banned " + ("permanently" if not info.get("until") else f"({fmt_left(info['until'] - time.time())} left)")
+    grants = [f"{grant_label(c)}: {'∞' if not g['limit'] else g['limit']}" for (u, c), g in GRANTS.items() if u == uid]
+    today = today_utc()
+    used = sum(n for (u, c), (day, n) in USAGE.items() if u == uid and day == today and not c.startswith("__"))
+    groups = list(rec.get("groups", {}).values()) + (["DM"] if rec.get("dm") else [])
+    recent = "\n".join(
+        f"🕒 <code>{h['time'][11:16]}</code> /{esc(h['command'])} ▸ <code>{esc(shorten(h['query'], 28))}</code> · {h['hits']} hit(s)"
+        for h in hist[-5:][::-1]
+    ) or "<i>No stored searches (history needs MongoDB).</i>"
+    text = (
+        f"👤 <b>USER PROFILE</b>\n{DIV}\n✅ <b>HAS USED THE BOT</b>\n"
+        + tree([
+            f"🆔 <b>ID</b> ▸ <code>{uid}</code>",
+            f"👤 <b>Name</b> ▸ <a href=\"tg://user?id={uid}\">{esc(rec['name'])}</a>",
+            f"🔗 <b>Username</b> ▸ {('@' + esc(rec['username'])) if rec.get('username') else '-'}",
+            f"🌐 <b>Language</b> ▸ <code>{esc(rec.get('lang') or '?')}</code>{' · ⭐ Premium' if rec.get('premium') else ''}",
+            f"📅 <b>First seen</b> ▸ <code>{when(rec['first'])}</code>",
+            f"🕒 <b>Last seen</b> ▸ <code>{when(rec['last'])}</code>",
+            f"🔎 <b>Lookups</b> ▸ <code>{rec['count']}</code> total · <code>{used}</code> today",
+            f"🧩 <b>By command</b> ▸ {esc(', '.join(f'/{k} ×{v}' for k, v in rec['by_cmd'].items()) or '-')}",
+            f"📍 <b>Seen in</b> ▸ {esc(shorten(', '.join(groups) or '-', 120))}",
+            f"⚠️ <b>Warnings</b> ▸ <code>{rec['warns']}</code> · 🚫 <b>Bans</b> ▸ <code>{rec['bans']}</code>",
+            f"🚦 <b>Status</b> ▸ {status}",
+            f"🎁 <b>Grants</b> ▸ {esc(', '.join(grants) or 'none')}",
+        ])
+        + f"\n\n📜 <b>LAST SEARCHES</b>\n{recent}"
+    )
+    rows = [
+        [btn("📄 Export JSON", f"us|json_{uid}|0", "success"), btn("📝 Export TXT", f"us|txt_{uid}|0", "success")],
+        [btn("📜 More searches", f"us|hist_{uid}|0"), btn("📡 To log channel", f"us|tolog_{uid}|0")],
+        [btn("✅ Unban", f"us|unban_{uid}|0", "success")] if banned else
+        [btn("🚫 Ban 1h", f"us|ban1h_{uid}|0", "danger"), btn("🚫 Ban forever", f"us|banp_{uid}|0", "danger")],
+        [btn("🎁 Grant", f"us|grant_{uid}|0"), ADMIN_BACK[0]],
+    ]
+    return text, rich_buttons(rows)
+
+
+async def user_profile_view(arg: str) -> tuple[str, InlineKeyboardMarkup, dict[str, Any] | None]:
+    rec = await find_user(arg)
+    if rec is None:
+        return (
+            f"❌ <b>No record</b> for <code>{esc(shorten(arg, 40))}</code>\n{DIV}\n"
+            "This person has <b>never used the bot</b> (or I have no record of them).\n"
+            "<i>Records start when someone first reaches the bot. Search by numeric ID or @username.</i>",
+            rich_buttons([[btn("👤 Search again", "us|find|0", "success"), ADMIN_BACK[0]]]),
+            None,
+        )
+    hist = (await build_dossier(rec, 10))["history"]
+    text, markup = render_user_profile(rec, hist)
+    return text, markup, rec
+
+
+async def show_user_profile(context: ContextTypes.DEFAULT_TYPE, arg: str, st: dict[str, Any]) -> None:
+    text, markup, _ = await user_profile_view(arg)
+    await _show(context, st, text, markup)
+
+
+async def cmd_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    arg = " ".join(context.args or []).strip()
+    reply = update.effective_message.reply_to_message
+    if not arg and reply and reply.from_user:
+        arg = str(reply.from_user.id)
+    if not arg:
+        await update.effective_message.reply_html(
+            "Usage: <code>/user &lt;user_id | @username&gt;</code> - or reply to someone's message with <code>/user</code>.",
+            reply_markup=rich_buttons([[btn("👤 Find a user", "us|find|0", "success")]]),
+        )
+        return
+    text, markup, _ = await user_profile_view(arg)
+    await update.effective_message.reply_html(text, reply_markup=markup)
+
+
+async def send_dossier(bot, chat_id: int, rec: dict[str, Any], fmt: str, caption_extra: str = "") -> None:
+    d = await build_dossier(rec)
+    if fmt == "txt":
+        blob, name = dossier_txt(d).encode("utf-8"), f"user_{rec['uid']}_dossier.txt"
+    else:
+        blob, name = json.dumps(d, indent=2, ensure_ascii=False, default=str).encode("utf-8"), f"user_{rec['uid']}_dossier.json"
+    sent = await bot.send_document(
+        chat_id=chat_id, document=InputFile(io.BytesIO(blob), filename=name),
+        caption=f"👤 <b>DOSSIER</b> · {esc(rec['name'])} (<code>{rec['uid']}</code>)\n🔎 {d['history_count']} stored search(es)\n"
+                f"⏳ <i>Self-destructs in 2 min</i>{caption_extra}",
+        parse_mode=ParseMode.HTML,
+    )
+    if not caption_extra:
+        autodelete(bot, sent, delay=120)
+
+
+async def handle_us(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
+    query = update.callback_query
+    admin_id = query.from_user.id
+    if key == "find":
+        await query.answer()
+        INPUT[admin_id] = {"op": "userq", "cmd": None, "chat": query.message.chat_id,
+                           "mid": query.message.message_id, "ts": time.time()}
+        await _safe_edit(query, USER_PROMPT, rich_buttons([[btn("✖️ Cancel", "adm|home|0", "danger")]]))
+        return
+    op, _, uid_s = key.partition("_")
+    if not uid_s.lstrip("-").isdigit():
+        await query.answer("Bad request.")
+        return
+    uid = int(uid_s)
+    rec = await find_user(str(uid))
+    if rec is None:
+        await query.answer("No record for that user.", show_alert=True)
+        return
+    if op in {"json", "txt"}:
+        await query.answer("Preparing file…")
+        await send_dossier(context.bot, query.message.chat_id, rec, op)
+        return
+    if op == "tolog":
+        ch = SETTINGS["log_channel"]
+        if not ch:
+            await query.answer("Connect a log channel first.", show_alert=True)
+            return
+        await query.answer("Sending to the log channel…")
+        try:
+            await send_dossier(context.bot, ch, rec, "json", caption_extra=f"\n📡 <i>requested by admin {admin_id}</i>")
+        except TelegramError as exc:
+            await query.message.reply_text(f"⚠️ Couldn't post to the log channel: {type(exc).__name__}")
+        return
+    if op == "hist":
+        await query.answer()
+        hist = (await build_dossier(rec, 12))["history"]
+        body = "\n".join(
+            f"🕒 <code>{h['time'][5:16].replace('T', ' ')}</code> /{esc(h['command'])} ▸ <code>{esc(shorten(h['query'], 30))}</code> · {h['hits']} hit(s) · {esc(h['status'])}"
+            for h in hist[::-1]
+        ) or "<i>No stored searches (history needs MongoDB).</i>"
+        await _safe_edit(query, f"📜 <b>LAST SEARCHES</b> · {esc(rec['name'])}\n{DIV}\n{body}",
+                         rich_buttons([[btn("⬅️ Profile", f"us|prof_{uid}|0")]]))
+        return
+    if op == "ban1h":
+        ban_user(uid, 60, "manual (admin panel)", admin_id)
+        await tell_user(context.bot, uid, None, ban_text(uid))
+        await query.answer("Banned for 1h")
+    elif op == "banp":
+        ban_user(uid, 0, "manual (admin panel)", admin_id)
+        await tell_user(context.bot, uid, None, ban_text(uid))
+        await query.answer("Banned permanently")
+    elif op == "unban":
+        unban_user(uid)
+        await tell_user(context.bot, uid, None, "✅ <b>You have been unbanned.</b> You can use the bot again.")
+        await query.answer("Unbanned ✅")
+    elif op == "grant":
+        GRANT_DRAFT[admin_id] = {**new_draft(), "uid": uid}
+        await query.answer()
+        await _safe_edit(query, *render_grant_builder(admin_id))
+        return
+    else:
+        await query.answer()
+    text, markup, _ = await user_profile_view(str(uid))
+    await _safe_edit(query, text, markup)
+
+
+# ---- log channel -----------------------------------------------------------
+
+
+def render_logchan() -> tuple[str, InlineKeyboardMarkup]:
+    s = SETTINGS
+    on = lambda v: "ON" if v else "off"  # noqa: E731
+    ch = s["log_channel"]
+    text = (
+        f"📡 <b>LOG CHANNEL</b>\n{DIV}\n"
+        + tree([
+            f"🔌 <b>Status</b> ▸ {'🟢 connected' if ch else '⚪ not connected'}" + (f" · <code>{ch}</code>" if ch else ""),
+            f"📨 <b>Sent</b> ▸ <code>{LOGSTAT['sent']}</code> · queued <code>{LOGQ.qsize()}</code> · dropped <code>{LOGSTAT['dropped']}</code>",
+            f"⚠️ <b>Errors</b> ▸ <code>{LOGSTAT['errors']}</code>" + (f" · last <code>{esc(LOGSTAT['last_error'])}</code>" if LOGSTAT["last_error"] else ""),
+            f"🔎 <b>Lookups</b> ▸ {on(s['log_search'])} · with results ▸ {on(s['log_results'])}",
+            f"🛡 <b>Moderation</b> (warnings, bans) ▸ {on(s['log_mod'])}",
+            f"⚙️ <b>Admin actions</b> ▸ {on(s['log_admin'])}",
+            f"🆕 <b>New users</b> ▸ {on(s['log_users'])}",
+            f"🗄 <b>Stored for dossiers</b> ▸ results {on(s['audit_results'])} · {AUDIT_DAYS} days",
+        ])
+        + "\n\n<i>Queries marked no-log or protected are never written to the channel. Full per-user history lives in MongoDB: /user &lt;id&gt; exports it as JSON or TXT.</i>"
+    )
+    rows = [
+        [btn("📡 Set channel", "adm|logset|0", "success"), btn("🧪 Send test", "adm|logtest|0", "primary")],
+        [_toggle("ls", "Lookups", s["log_search"]), _toggle("lr", "Results", s["log_results"])],
+        [_toggle("lm", "Moderation", s["log_mod"]), _toggle("la", "Admin", s["log_admin"])],
+        [_toggle("lu", "New users", s["log_users"]), _toggle("ar", "Store results", s["audit_results"])],
+        [btn("🔌 Disconnect", "adm|logoff|0", "danger"), ADMIN_BACK[0]],
+    ]
+    return text, rich_buttons(rows)
+
+
+async def set_log_channel(bot, ch: int) -> tuple[bool, str]:
+    try:
+        chat = await bot.get_chat(ch)
+        await bot.send_message(
+            ch, f"📡 <b>Log channel connected</b>\n{DIV}\nThis channel now receives lookups, warnings, bans and admin actions.\n🕒 {when()}",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as exc:
+        return False, f"{type(exc).__name__}: {shorten(str(exc), 90)}"
+    SETTINGS["log_channel"] = ch
+    LOGSTAT["alerted"] = False
+    persist()
+    return True, getattr(chat, "title", None) or str(ch)
+
+
+async def send_log_test(bot) -> tuple[bool, str]:
+    ch = SETTINGS["log_channel"]
+    if not ch:
+        return False, "No log channel connected."
+    try:
+        await bot.send_message(ch, f"🧪 <b>Test message</b>\n🕒 {when()}", parse_mode=ParseMode.HTML)
+    except TelegramError as exc:
+        return False, f"🔴 Failed: {type(exc).__name__} - {shorten(str(exc), 90)}"
+    return True, "🟢 Test message delivered."
+
+
+async def log_worker(bot) -> None:
+    """Drains the log queue slowly enough to respect Telegram's channel limits."""
+    while True:
+        text = await LOGQ.get()
+        ch = int(SETTINGS["log_channel"] or 0)
+        if not ch:
+            continue
+        for _ in range(3):
+            try:
+                try:
+                    await bot.send_message(ch, text[:4000], parse_mode=ParseMode.HTML,
+                                           link_preview_options=NO_PREVIEW, disable_notification=True)
+                except BadRequest as exc:
+                    if "parse" not in str(exc).lower() and "entit" not in str(exc).lower():
+                        raise
+                    await bot.send_message(ch, strip_tags(text)[:4000], disable_notification=True)
+                LOGSTAT["sent"] += 1
+                LOGSTAT["alerted"] = False
+                break
+            except RetryAfter as exc:
+                wait = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else float(exc.retry_after)
+                await asyncio.sleep(wait + 1)
+            except TelegramError as exc:
+                LOGSTAT["errors"] += 1
+                LOGSTAT["last_error"] = type(exc).__name__
+                if not LOGSTAT["alerted"]:
+                    LOGSTAT["alerted"] = True
+                    await notify_admins(
+                        bot, f"⚠️ <b>Log channel problem</b>\nI can't post to <code>{ch}</code> ({esc(type(exc).__name__)}). "
+                             "Make sure the bot is an <b>admin</b> there with “Post messages”.")
+                break
+        await asyncio.sleep(LOG_INTERVAL)
+
+
+async def handle_channel_membership(ev: Any, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat, adder = ev.chat, ev.from_user
+    old, new = ev.old_chat_member.status, ev.new_chat_member.status
+    gone = (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+    present = (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR)
+    title = esc(chat.title or chat.id)
+    if new in present and old in gone:
+        if is_admin(adder.id):
+            await notify_admins(
+                context.bot,
+                f"📡 <b>Added to channel</b>\n<b>{title}</b> · <code>{chat.id}</code>\nUse it as the log channel?",
+                rich_buttons([[btn("📡 Use as log channel", f"lc|{chat.id}|0", "success")]]),
+            )
+        else:  # a stranger adding the bot to their channel must never become the log destination
+            try:
+                await context.bot.leave_chat(chat.id)
+            except TelegramError:
+                pass
+            await notify_admins(context.bot, f"🚫 <b>Channel add blocked</b>\n<b>{title}</b> (<code>{chat.id}</code>) by {esc(adder.full_name)} (<code>{adder.id}</code>) - I left.")
+    elif new in gone and chat.id == SETTINGS["log_channel"]:
+        SETTINGS["log_channel"] = 0
+        persist()
+        await notify_admins(context.bot, f"📡 <b>Log channel lost</b>\nI was removed from <b>{title}</b>; logging is off.")
+
+
+async def cmd_setlog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    arg = (context.args[0] if context.args else "").lower()
+    if arg in {"off", "none", "0"}:
+        SETTINGS["log_channel"] = 0
+        persist()
+        await update.effective_message.reply_html("📡 Log channel disconnected.")
+        return
+    if not arg.lstrip("-").isdigit():
+        text, markup = render_logchan()
+        await update.effective_message.reply_html(
+            text + "\n\nUsage: <code>/setlog &lt;channel_id&gt;</code> or <code>/setlog off</code>", reply_markup=markup)
+        return
+    good, info = await set_log_channel(context.bot, int(arg))
+    await update.effective_message.reply_html(
+        f"✅ Log channel connected: <b>{esc(info)}</b>" if good else
+        f"⚠️ I couldn't post there: <code>{esc(info)}</code>\nAdd the bot to the channel as an <b>admin with “Post messages”</b>.")
+
+
+# --------------------------------------------------------------------------- #
+# Rich UI (Bot API 10.1 - 10.3) and welcome messages                           #
+# --------------------------------------------------------------------------- #
+
+BOTINFO: dict[str, str] = {"username": ""}
+RICH: dict[str, Any] = {"ok": True, "fails": 0, "sent": 0, "last_error": "", "alerted": False}
+WELCOME_LAST: dict[int, float] = {}
+
+
+def _urls(name: str) -> list[str]:
+    return [u.strip() for u in os.environ.get(name, "").split(",") if u.strip().startswith(("http://", "https://"))]
+
+
+MENU_IMAGES, WELCOME_IMAGES = _urls("MENU_IMAGES"), _urls("WELCOME_IMAGES")
+OWNER_URL, UPDATES_URL, SUPPORT_URL = (os.environ.get(n, "").strip() for n in ("OWNER_URL", "UPDATES_URL", "SUPPORT_URL"))
+WELCOME_PROMPT = ("✏️ <b>Welcome text</b>\nSend extra rules / info shown in every welcome message (max 600 chars), "
+                  "or <code>clear</code>.")
+
+
+class Sent:
+    def __init__(self, chat_id: int, message_id: int) -> None:
+        self.chat_id, self.message_id = chat_id, message_id
+
+
+def rich_enabled() -> bool:
+    return bool(SETTINGS["rich_ui"]) and RICH["ok"]
+
+
+def rich_status() -> str:
+    if not RICH["ok"]:
+        return "🔴 disabled (fallback HTML)"
+    return f"{RICH['sent']} sent · {RICH['fails']} recent fails"
+
+
+def is_rich(msg: Any) -> bool:
+    return bool(getattr(msg, "rich_message", None) or (getattr(msg, "api_kwargs", None) or {}).get("rich_message"))
+
+
+async def _rich_fail(bot, exc: Exception) -> None:
+    RICH["fails"] += 1
+    RICH["last_error"] = f"{type(exc).__name__}: {shorten(str(exc), 140)}"
+    log.warning("rich message failed: %s", RICH["last_error"])
+    hard = any(x in str(exc).lower() for x in ("not found", "unknown method", "method not"))
+    if (hard or RICH["fails"] >= 8) and RICH["ok"]:
+        RICH["ok"] = False
+        if not RICH["alerted"]:
+            RICH["alerted"] = True
+            why = "the method isn't available on this Bot API server" if hard else f"{RICH['fails']} rich messages in a row were rejected"
+            await notify_admins(
+                bot, f"✨ <b>Rich UI switched off</b>\n{DIV}\nTelegram refused rich messages ({why}).\n<code>{esc(RICH['last_error'])}</code>\n"
+                     "The bot keeps working with classic formatting. Re-enable it in Settings → Rich UI when ready.")
+
+
+async def send_rich(bot, chat_id: int, html_text: str, markup: InlineKeyboardMarkup | None = None,
+                    reply_to: int | None = None, skip_entities: bool = True) -> Sent | None:
+    """sendRichMessage (Bot API 10.1+). Returns None on any failure so the caller can fall back."""
+    kw: dict[str, Any] = {"chat_id": chat_id, "rich_message": {"html": html_text, "skip_entity_detection": skip_entities}}
+    if markup is not None:
+        kw["reply_markup"] = markup
+    if reply_to:
+        kw["reply_parameters"] = ReplyParameters(reply_to, allow_sending_without_reply=True)
+    try:
+        res = await bot.do_api_request("sendRichMessage", api_kwargs=kw)
+    except AttributeError:  # python-telegram-bot too old for raw API calls: classic formatting only
+        RICH["ok"], RICH["last_error"] = False, "python-telegram-bot lacks do_api_request (upgrade to >=22.7)"
+        return None
+    except TelegramError as exc:
+        await _rich_fail(bot, exc)
+        return None
+    RICH["fails"] = 0
+    RICH["sent"] += 1
+    mid = res.get("message_id") if isinstance(res, dict) else getattr(res, "message_id", None)
+    return Sent(chat_id, int(mid)) if mid else None
+
+
+async def rich_edit_message(bot, chat_id: int, message_id: int, html_text: str,
+                            markup: InlineKeyboardMarkup | None = None, skip_entities: bool = True) -> bool:
+    kw: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id,
+                          "rich_message": {"html": html_text, "skip_entity_detection": skip_entities}}
+    if markup is not None:
+        kw["reply_markup"] = markup
+    try:
+        await bot.do_api_request("editMessageText", api_kwargs=kw)
+    except AttributeError:
+        RICH["ok"], RICH["last_error"] = False, "python-telegram-bot lacks do_api_request (upgrade to >=22.7)"
+        return False
+    except BadRequest as exc:
+        if "not modified" in str(exc).lower():
+            return True
+        await _rich_fail(bot, exc)
+        return False
+    except TelegramError as exc:
+        await _rich_fail(bot, exc)
+        return False
+    RICH["fails"] = 0
+    return True
+
+
+async def edit_view(query, text: str, markup: InlineKeyboardMarkup | None, rich_html: str | None = None,
+                    rich_markup: InlineKeyboardMarkup | None = None) -> None:
+    """Show a view: rich when possible (edit a rich message in place, or replace a classic one), else classic."""
+    msg = query.message
+    if rich_html and rich_enabled():
+        bot = query.get_bot()
+        mk = rich_markup if rich_markup is not None else markup
+        if is_rich(msg):
+            if await rich_edit_message(bot, msg.chat_id, msg.message_id, rich_html, mk):
+                return
+        elif await send_rich(bot, msg.chat_id, rich_html, mk) is not None:
+            try:
+                await msg.delete()
+            except TelegramError:
+                pass
+            return
+    await _safe_edit(query, text, markup)
+
+
+# ---- tiny HTML builders (rich dialect) --------------------------------------
+
+
+def rtable(rows: list[list[str]], header: list[str] | None = None, compact: bool = False, striped: bool = True) -> str:
+    attrs = "bordered" + (" striped" if striped else "") + (" compact" if compact else "")
+    out = [f"<table {attrs}>"]
+    if header:
+        out.append("<tr>" + "".join(f"<th>{c}</th>" for c in header) + "</tr>")
+    out += ["<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in rows]
+    out.append("</table>")
+    return "".join(out)
+
+
+def rdetails(summary: str, body: str, opened: bool = False) -> str:
+    return f"<details{' open' if opened else ''}><summary>{summary}</summary>{body}</details>"
+
+
+def fmt_uptime() -> str:
+    sec = int(time.time() - STATS["started"])
+    return f"{sec // 3600}h {sec % 3600 // 60}m {sec % 60}s"
+
+
+def link_rows() -> list[list[InlineKeyboardButton]]:
+    rows: list[list[InlineKeyboardButton]] = []
+    if BOTINFO["username"]:
+        rows.append([link_btn("✚ ADD ME IN YOUR GROUP ✚", f"https://t.me/{BOTINFO['username']}?startgroup=true", "primary")])
+    pair = []
+    if OWNER_URL:
+        pair.append(link_btn("👑 Owner", OWNER_URL, "danger"))
+    if UPDATES_URL:
+        pair.append(link_btn("📢 Updates", UPDATES_URL, "success"))
+    if pair:
+        rows.append(pair)
+    if SUPPORT_URL:
+        rows.append([link_btn("🆘 Support", SUPPORT_URL, "primary")])
+    return rows
+
+
+def slideshow(urls: list[str], caption: str = "") -> str:
+    if not urls:
+        return ""
+    cap = f"<figcaption>{caption}</figcaption>" if caption else ""
+    return "<tg-slideshow>" + "".join(f'<img src="{esc(u)}"/>' for u in urls[:10]) + cap + "</tg-slideshow>"
+
+
+def record_pairs(item: Any, p: dict[str, Any]) -> tuple[list[tuple[str, str]], str | None]:
+    hide = p.get("hide") or []
+    if not isinstance(item, dict):
+        return [("Value", shorten(strip_tags(item), 220))], None
+    used: set[str] = set()
+    tk, _ = pick(item, TITLE_KEYS)
+    if tk:
+        used.add(tk)
+    bk, body = pick(item, BODY_KEYS)
+    body_text = None
+    if bk and isinstance(body, str):
+        used.add(bk)
+        body_text = shorten(strip_tags(body), 300)
+    pairs = [(k, mask_if_sensitive(k, format_scalar(v)))
+             for k, v in flatten({k: v for k, v in item.items() if k not in used}) if not hidden(k, hide)]
+    return pairs, body_text
+
+
+def _fields_table(pairs: list[tuple[str, str]], icons: dict[str, str]) -> str:
+    return rtable([[f"{key_icon(k, icons)} {esc(k)}", f"<code>{esc(v)}</code>"] for k, v in pairs], header=["Field", "Value"])
+
+
+def rich_results_html(key: str, result: SearchResult, page: int) -> str:
+    """Rich results page. Tries bigger tables first and shrinks until it fits Telegram's block / size limits."""
+    meta = META.get(key, {})
+    p = profile(meta.get("src"))
+    icons = p.get("icons") or {}
+    total = len(result.items)
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * PAGE_SIZE
+    chunk = result.items[start : start + PAGE_SIZE]
+    rows = [["🎯 <b>Target</b>", f"<code>{esc(shorten(result.query, 64))}</code>"],
+            ["📦 <b>Records</b>", f"<code>{total}</code> · page <code>{page + 1}/{pages}</code>"],
+            ["⚡ <b>Speed</b>", f"<code>{result.elapsed_ms} ms</code> · <code>{clock()[:5]} UTC</code>"]]
+    if meta.get("by"):
+        rows.append(["🙋 <b>Requested by</b>", esc(meta["by"])])
+    if xf_of(p).get("meta", True):
+        for k, v in list(result.meta.items())[:3]:
+            if str(k).lower() not in {"query", "q"}:
+                rows.append([f"ℹ️ {esc(humanize_key(k))}", esc(format_scalar(v))])
+    d = eff(p, "auto_delete")
+    foot = "🔐 Sensitive fields masked · tap any value to copy"
+    if p.get("footer"):
+        foot += f"<br>📝 {esc(p['footer'])}"
+    if d:
+        foot += f"<br>⏳ Self-destructs {fmt_dur(d)} after the lookup"
+    head = f"<h3>{emoji_html(p)} {esc(str(p['title']).upper())} COMPLETE ✅</h3>" + rtable(rows, compact=True, striped=False)
+    tail = f"<hr/><footer>{foot}</footer>"
+    out = head + tail
+    for budget in (400, 250, 150, 80, 40):  # Rich Messages: ~500 blocks and 32768 characters
+        per = max(4, budget // max(1, len(chunk)) - 4)
+        n_show, n_rest = max(3, round(per * 0.6)), max(0, per - max(3, round(per * 0.6)))
+        parts = [head]
+        for i, item in enumerate(chunk):
+            idx = start + i
+            pairs, body = record_pairs(item, p)
+            shown, rest = pairs[:n_show], pairs[n_show : n_show + n_rest]
+            dropped = len(pairs) - len(shown) - len(rest)
+            parts.append(f"<h4>{MARKERS[idx % len(MARKERS)]} {esc(item_title(item, idx))} <i>· {len(pairs)} fields</i></h4>")
+            if body:
+                parts.append(f"<p>💬 <i>{esc(body)}</i></p>")
+            if shown:
+                parts.append(_fields_table(shown, icons))
+            if rest:
+                parts.append(rdetails(f"➕ {len(rest)} more field{'s' if len(rest) != 1 else ''}", _fields_table(rest, icons)))
+            if dropped > 0:
+                parts.append(f"<p><i>… +{dropped} more field(s) - open the record or export.</i></p>")
+        parts.append(tail)
+        out = "".join(parts)
+        if len(out) <= 30000:
+            break
+    return out
+
+
+def rich_detail_html(key: str, result: SearchResult, index: int) -> str:
+    meta = META.get(key, {})
+    p = profile(meta.get("src"))
+    icons, hide = p.get("icons") or {}, p.get("hide") or []
+    index = max(0, min(index, len(result.items) - 1))
+    item = result.items[index]
+    pairs, body = record_pairs(item, p)
+    raw_full = json.dumps(masked_copy(item, hide=hide), indent=2, ensure_ascii=False, default=str)
+    brand = f" · {emoji_html(p)} {esc(p['title'])}" if meta.get("src") else ""
+    d = eff(p, "auto_delete")
+    out = ""
+    for cap, raw_cap in ((300, 5000), (150, 2500), (80, 1000), (40, 0)):
+        parts = [
+            f"<h3>🗂 RECORD DETAIL ✨{brand}</h3>",
+            rtable([["🎯 <b>Target</b>", f"<code>{esc(shorten(result.query, 60))}</code>"],
+                    ["📌 <b>Record</b>", f"<code>{index + 1}/{len(result.items)}</code> · <code>{len(pairs)}</code> fields"]],
+                   compact=True, striped=False),
+            f"<h4>{esc(item_title(item, index))}</h4>",
+        ]
+        if body:
+            parts.append(f"<p>💬 <i>{esc(body)}</i></p>")
+        parts.append(_fields_table(pairs[:cap], icons) if pairs else "<p><i>No fields.</i></p>")
+        if len(pairs) > cap:
+            parts.append(f"<p><i>… +{len(pairs) - cap} more field(s) - use Save JSON for the complete record.</i></p>")
+        if raw_cap:
+            raw = raw_full[:raw_cap] + ("\n…" if len(raw_full) > raw_cap else "")
+            parts.append(rdetails("🧾 <b>Raw JSON</b>", f'<pre><code class="language-json">{esc(raw)}</code></pre>'))
+        parts.append(f"<hr/><footer>🔐 Sensitive fields masked{' · ⏳ Self-destructs ' + fmt_dur(d) + ' after the lookup' if d else ''}</footer>")
+        out = "".join(parts)
+        if len(out) <= 30000:
+            break
+    return out
+
+
+def rich_menu_html(user_id: int) -> str:
+    name = (USERS.get(user_id) or {}).get("name") or USER_STATS.get(user_id, {}).get("name") or "there"
+    icon = CUSTOM_EMOJI["search"]
+    logo = tg_emoji(icon, "🕵️") if icon else "🕵️"
+    cmds = [f"<code>/{esc(n)}</code>{' 🛠' if maint_active(c) else ''}" for n, c in SOURCES.items() if c.get("enabled")]
+    why = rtable([["⚡ <b>Speed</b>", "Cached, rate-limited, no lag"],
+                  ["🔐 <b>Privacy</b>", "Results self-destruct, fields masked"],
+                  ["🛡 <b>Protection</b>", "Protected queries, abuse guard, bans"],
+                  ["🧩 <b>Control</b>", "Per-command limits, grants, maintenance"]], striped=False)
+    snap = rtable([["✅ <b>Status</b>", "Online" if RUNTIME.get("api_url") else "Source not connected"],
+                   ["⏱ <b>Uptime</b>", f"<code>{fmt_uptime()}</code>"],
+                   ["💾 <b>Storage</b>", esc(storage_label())],
+                   ["🧹 <b>Auto-delete</b>", fmt_dur(SETTINGS["auto_delete"])],
+                   ["🧩 <b>Commands</b>", " ".join(["<code>/num</code>"] + cmds)]], striped=False)
+    return (
+        slideshow(MENU_IMAGES, f"{esc(BOT_NAME)} — swipe to explore")
+        + f"<h2>{logo} {esc(BOT_NAME)} • Lookup Hub</h2>"
+        + "<p><i>Fast • private • professional intelligence lookups</i></p>"
+        + f"<p>👋 <b>Welcome, {esc(name)}</b><br><i>Send a name, username, email, phone, domain or IP to get started.</i></p>"
+        + "<h3>WHAT I CAN DO</h3>"
+        + "<blockquote>🗂 Clean, readable record cards<br>📑 Paged browsing with a full detail view<br>"
+          "📥 One-tap JSON export<br>🔐 Auto-masked sensitive fields<br>🧹 Results vanish on their own</blockquote>"
+        + rdetails("⭐ <b>WHY THIS BOT</b>", why)
+        + rdetails("📡 <b>BOT SNAPSHOT</b>", snap)
+        + "<p><i>Tip: use /help anytime to see every command. Stuck? Tap Support below.</i></p>"
+    )
+
+
+# ---- welcome message and /commands ----------------------------------------
+
+
+def command_table_rows(gid: int | None) -> list[tuple[str, str, str, str]]:
+    rows = []
+    for n, p in [(None, DEFAULT_PROFILE)] + [(n, c) for n, c in SOURCES.items() if c.get("enabled")]:
+        if gid is not None and not group_allows(gid, n):
+            continue
+        label = "/num" if n is None else f"/{n}"
+        ex = p.get("example") or "<query>"
+        lim = int(eff(p, "daily_limit"))
+        title = p.get("title") or "Lookup"
+        flag = " 🛠" if n and maint_active(p) else ""
+        rows.append((label, f"{label} {ex}", f"{'∞' if not lim else lim}/day · {float(eff(p, 'cooldown')):g}s cooldown", f"{title}{flag}"))
+    return rows
+
+
+def mentions(members: list[Any]) -> str:
+    return ", ".join(f'<a href="tg://user?id={m.id}">{esc(getattr(m, "full_name", None) or m.id)}</a>' for m in members[:6])
+
+
+def welcome_rich_html(members: list[Any], gid: int | None) -> str:
+    rows = [[f"<code>{esc(c)}</code>", esc(t), f"<code>{esc(ex)}</code>", esc(lim)] for c, ex, lim, t in command_table_rows(gid)]
+    rules = ("• Be respectful - abuse gets an automatic ban<br>• Results self-destruct after "
+             f"{fmt_dur(SETTINGS['auto_delete'])}<br>• Use <code>/optout &lt;number&gt;</code> to protect your own number")
+    if SETTINGS["welcome_text"]:
+        rules += f"<br>• {esc(SETTINGS['welcome_text'])}"
+    return (
+        slideshow(WELCOME_IMAGES)
+        + f"<h2>👋 Welcome!</h2><p>{mentions(members)}</p>"
+        + "<h3>🔎 How to search</h3>"
+        + rtable(rows, header=["Command", "What it does", "Example", "Limit"])
+        + rdetails("📌 <b>RULES</b>", f"<p>{rules}</p>", opened=True)
+        + "<p><i>Tip: send /commands anytime to see this list again.</i></p>"
+    )
+
+
+def welcome_classic(members: list[Any], gid: int | None) -> str:
+    lines = "\n".join(f"▸ <code>{esc(ex)}</code>\n   {esc(t)} · {esc(lim)}" for _, ex, lim, t in command_table_rows(gid))
+    extra = f"\n📌 {esc(SETTINGS['welcome_text'])}" if SETTINGS["welcome_text"] else ""
+    return (f"👋 <b>Welcome!</b>\n{mentions(members)}\n{DIV}\n🔎 <b>How to search</b>\n{lines}\n\n"
+            f"🛡 <code>/optout &lt;number&gt;</code> ▸ protect your own number\n📖 <code>/commands</code> ▸ show this list{extra}\n"
+            f"<i>Abuse gets an automatic ban. Results self-destruct after {fmt_dur(SETTINGS['auto_delete'])}.</i>")
+
+
+def welcome_markup() -> InlineKeyboardMarkup | None:
+    rows = link_rows()
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def send_welcome(bot, chat_id: int, members: list[Any], gid: int | None, delay: float | None = None) -> Sent | None:
+    sent: Any = None
+    if rich_enabled():
+        sent = await send_rich(bot, chat_id, welcome_rich_html(members, gid), welcome_markup(), skip_entities=False)
+    if sent is None:
+        try:
+            sent = await bot.send_message(chat_id, welcome_classic(members, gid), parse_mode=ParseMode.HTML,
+                                          reply_markup=welcome_markup(), link_preview_options=NO_PREVIEW)
+        except TelegramError:
+            return None
+    autodelete(bot, sent, delay=SETTINGS["welcome_delete"] if delay is None else delay)
+    return sent
+
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat, msg = update.effective_chat, update.effective_message
+    meta = ALLOWED_GROUPS.get(chat.id)
+    if meta is None or meta.get("muted"):
+        return
+    flag = meta.get("welcome")
+    if not (SETTINGS["welcome"] if flag is None else flag):
+        return
+    members = [m for m in (msg.new_chat_members or []) if not getattr(m, "is_bot", False)]
+    if not members:
+        return
+    now = time.time()
+    if now - WELCOME_LAST.get(chat.id, 0) < 20:  # a burst of joins gets one welcome
+        return
+    WELCOME_LAST[chat.id] = now
+    await send_welcome(context.bot, chat.id, members, chat.id)
+    logchan("users", f"👥 <b>JOINED GROUP</b>\n{DIV}\n{esc(chat.title)} (<code>{chat.id}</code>)\n"
+                     + "\n".join(user_html(m.id, m.full_name, m.username) for m in members[:5]) + f"\n🕒 {when()}")
+
+
+async def cmd_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    gid = chat.id if chat.type in GROUP_TYPES else None
+    user = update.effective_user
+    sent = None
+    if rich_enabled():
+        rows = [[f"<code>{esc(c)}</code>", esc(t), f"<code>{esc(ex)}</code>", esc(lim)] for c, ex, lim, t in command_table_rows(gid)]
+        html_text = ("<h3>📖 Commands</h3>" + rtable(rows, header=["Command", "What it does", "Example", "Limit"])
+                     + "<p><i>🛡 /optout &lt;number&gt; protects your own number.</i></p>")
+        sent = await send_rich(context.bot, chat.id, html_text, None, reply_to=update.effective_message.message_id, skip_entities=False)
+    if sent is None:
+        sent = await update.effective_message.reply_html(welcome_classic([user], gid), link_preview_options=NO_PREVIEW)
+    if gid is not None:
+        autodelete(context.bot, sent, update.effective_message, delay=90)
+
+
+def render_welcome() -> tuple[str, InlineKeyboardMarkup]:
+    s = SETTINGS
+    text = (
+        f"👋 <b>WELCOME MESSAGE</b>\n{DIV}\n"
+        + block_table([
+            ("📣 New-member welcome", "ON" if s["welcome"] else "off"),
+            ("🗑 Auto-delete", fmt_dur(s["welcome_delete"]) if s["welcome_delete"] else "never"),
+            ("📌 Custom text", shorten(s["welcome_text"], 60) or "none"),
+            ("🖼 Slideshow images", f"{len(WELCOME_IMAGES)} (WELCOME_IMAGES env)"),
+        ])
+        + "\n\n<i>Shows every enabled command with an example and its limits. Override per group in Groups → ⚙️. "
+          "Members can run /commands any time.</i>"
+    )
+    rows = [
+        [_toggle("wl", "Welcome new members", s["welcome"])],
+        [btn("🗑 Auto-delete after", "noop", None)],
+        _opt_row("wd", s["welcome_delete"], [("Never", 0), ("30s", 30), ("1m", 60), ("2m", 120), ("5m", 300)]),
+        [btn("✏️ Custom text", "adm|welcometext|0", "success"), btn("👁 Preview", "adm|welcomeprev|0", "primary")],
+        ADMIN_BACK,
+    ]
+    return text, rich_buttons(rows)
+
+
+async def rich_selftest(bot, chat_id: int) -> tuple[bool, str]:
+    """Send a sample Rich Message so the admin can see (and verify) native rendering."""
+    html_text = (
+        "<h2>✨ Rich UI self-test</h2><p><i>If you can see a table and a collapsible section, your client supports Rich Messages.</i></p>"
+        + rtable([["✅ <b>Table</b>", "Bordered, striped, native"], ["📑 <b>Details</b>", "Tap the section below"]], header=["Feature", "Result"])
+        + rdetails("⭐ <b>OPEN ME</b>", "<blockquote>Collapsible content works.</blockquote>")
+        + "<hr/><footer>Bot API 10.3 · sendRichMessage</footer>"
+    )
+    mk = InlineKeyboardMarkup([[btn("✅ Looks good", "close|0|0", "success"), btn("🗑 Close", "close|0|0", "danger")]])
+    sent = await send_rich(bot, chat_id, html_text, mk)
+    if sent is None:
+        return False, f"🔴 Rich message rejected: {RICH['last_error'] or 'unknown error'} - classic formatting is used."
+    autodelete(bot, sent, delay=60)
+    return True, "🟢 Rich message delivered. Clients that can't render it show an 'unsupported' placeholder."
+
+
+# --------------------------------------------------------------------------- #
 # Callbacks                                                                    #
 # --------------------------------------------------------------------------- #
 
 KEYED_ACTIONS = {"p", "d", "x", "f", "close"}
-ADMIN_ACTIONS = {"adm", "set", "ub", "lg", "ap", "rj", "cx", "oo", "bc", "brk", "gr"}
+ADMIN_ACTIONS = {"adm", "set", "ub", "lg", "ap", "rj", "cx", "oo", "bc", "brk", "gr", "xf", "us", "lc"}
 
 
 async def _safe_edit(query, text: str, markup: InlineKeyboardMarkup | None) -> None:
@@ -3836,7 +5413,19 @@ async def _safe_edit(query, text: str, markup: InlineKeyboardMarkup | None) -> N
             text, parse_mode=ParseMode.HTML, reply_markup=markup, link_preview_options=NO_PREVIEW
         )
     except BadRequest as exc:
-        if "not modified" not in str(exc).lower():
+        low = str(exc).lower()
+        if "not modified" in low:
+            return
+        if "parse" in low or "entit" in low:
+            log.warning("edit failed: %s", exc)
+            return
+        # a Rich Message cannot be edited as plain text - replace it with the classic view instead
+        msg = query.message
+        try:
+            await query.get_bot().send_message(msg.chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup,
+                                               link_preview_options=NO_PREVIEW)
+            await msg.delete()
+        except (TelegramError, AttributeError):
             log.warning("edit failed: %s", exc)
 
 
@@ -3848,6 +5437,20 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if action == "cx":
         await handle_cx(update, context, key)
+        return
+
+    if action == "xf":
+        await handle_xf(update, context, key)
+        return
+
+    if action == "us":
+        await handle_us(update, context, key)
+        return
+
+    if action == "lc":  # "Use as log channel" button from the channel-added notice
+        good, info = await set_log_channel(context.bot, int(key))
+        await query.answer("Log channel connected ✅" if good else f"Couldn't post: {info}"[:190], show_alert=not good)
+        await _safe_edit(query, f"📡 Log channel: <b>{esc(info)}</b>" if good else f"⚠️ <code>{esc(info)}</code>", InlineKeyboardMarkup([]))
         return
 
     if action == "adm":
@@ -3877,6 +5480,46 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode=ParseMode.HTML,
             )
             autodelete(context.bot, sent, delay=120)
+            return
+        elif key == "welcome":
+            await query.answer()
+        elif key == "welcometext":
+            await query.answer()
+            INPUT[user_id] = {"op": "welcometext", "cmd": None, "chat": query.message.chat_id,
+                              "mid": query.message.message_id, "ts": time.time()}
+            await _safe_edit(query, WELCOME_PROMPT, rich_buttons([[btn("✖️ Cancel", "adm|welcome|0", "danger")]]))
+            return
+        elif key == "welcomeprev":
+            await query.answer("Sending preview…")
+            await send_welcome(context.bot, query.message.chat_id, [query.from_user], None, delay=60)
+            return
+        elif key == "richtest":
+            good, info = await rich_selftest(context.bot, query.message.chat_id)
+            await query.answer(info[:190], show_alert=True)
+            return
+        elif key.startswith("gwel_"):
+            meta = ALLOWED_GROUPS.get(int(key[5:]))
+            if meta is not None:
+                meta["welcome"] = {None: True, True: False, False: None}[meta.get("welcome")]
+                persist()
+            await query.answer("Saved ✅")
+            key = "gv_" + key[5:]
+        elif key == "logchan":
+            await query.answer()
+        elif key == "logtest":
+            ok_, info = await send_log_test(context.bot)
+            await query.answer(info[:190], show_alert=True)
+            return
+        elif key == "logoff":
+            SETTINGS["log_channel"] = 0
+            persist()
+            await query.answer("Log channel disconnected")
+            key = "logchan"
+        elif key == "logset":
+            await query.answer()
+            INPUT[user_id] = {"op": "logchan", "cmd": None, "chat": query.message.chat_id,
+                              "mid": query.message.message_id, "ts": time.time()}
+            await _safe_edit(query, LOG_PROMPT, rich_buttons([[btn("✖️ Cancel", "adm|logchan|0", "danger")]]))
             return
         elif key == "security":
             await query.answer()
@@ -3965,6 +5608,10 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             text, markup = render_banned()
         elif key == "blocklist":
             text, markup = render_blocklist()
+        elif key == "welcome":
+            text, markup = render_welcome()
+        elif key == "logchan":
+            text, markup = render_logchan()
         elif key == "security":
             text, markup = render_security()
         elif key == "optouts":
@@ -4016,6 +5663,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             GRANTS.pop((int(uid_s), cmd), None)
             persist()
             note, view = "Grant removed", "list"
+            alog(user_id, f"🗑 Grant removed → {user_html(int(uid_s), uname(int(uid_s)))} · {esc(grant_label(cmd))}")
         await query.answer(note)
         if view == "list":
             text, markup = render_grants()
@@ -4078,12 +5726,13 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         SETTINGS[name] = bool(index) if isinstance(current, bool) else type(current)(index)
         save_state()
         await query.answer("Saved ✅")
-        text, markup = render_security() if key in SECURITY_KEYS else render_settings()
+        text, markup = setting_view(key)
         await _safe_edit(query, text, markup)
         return
 
     if action == "ub":
         unban_user(int(key))
+        await tell_user(context.bot, int(key), None, "✅ <b>You have been unbanned.</b> You can use the bot again - please follow the usage rules.")
         await query.answer("Unbanned ✅")
         text, markup = render_banned()
         await _safe_edit(query, text, markup)
@@ -4117,6 +5766,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 await _safe_edit(query, f"⚪ <b>{esc(title)}</b> - the bot is no longer in this group.", done)
                 return
             authorize_group(gid, title, user_id)
+            alog(user_id, f"✅ Group approved: <b>{esc(title)}</b> (<code>{gid}</code>)")
             await query.answer("Approved ✅")
             await _safe_edit(
                 query,
@@ -4137,6 +5787,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 await context.bot.leave_chat(gid)
             except TelegramError:
                 pass
+            alog(user_id, f"❌ Group rejected: <b>{esc(title)}</b> (<code>{gid}</code>)")
             await query.answer("Rejected")
             await _safe_edit(
                 query,
@@ -4197,7 +5848,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "menu":
         await query.answer()
         text, markup = render_menu(user_id)
-        await _safe_edit(query, text, markup)
+        extra = link_rows()
+        await edit_view(query, text, markup, rich_menu_html(user_id) if rich_enabled() else None,
+                        InlineKeyboardMarkup(list(markup.inline_keyboard) + extra) if extra else markup)
         return
 
     if action == "help":
@@ -4246,14 +5899,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if action == "p":
         text, markup = render_results(key, result, index)
+        rich_html = rich_results_html(key, result, index) if rich_enabled() else None
     elif action == "d":
         text, markup = render_detail(key, result, index)
+        rich_html = rich_detail_html(key, result, index) if rich_enabled() else None
     else:
         await query.answer("Unsupported button.")
         return
 
     await query.answer()
-    await _safe_edit(query, text, markup)
+    await edit_view(query, text, markup, rich_html)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4278,7 +5933,9 @@ async def post_init(app: Application) -> None:
 
     app.bot_data["sweeper"] = asyncio.create_task(pending_sweeper(bot))
     app.bot_data["housekeeping"] = asyncio.create_task(housekeeping(bot))
+    app.bot_data["logworker"] = asyncio.create_task(log_worker(bot))
     me = await bot.get_me()
+    BOTINFO["username"] = me.username or ""
     log.info(
         "Online as @%s | source %s | %d admin(s) | %d group(s)",
         me.username, "connected" if RUNTIME["api_url"] else "MISSING", len(ADMIN_IDS), len(ALLOWED_GROUPS),
@@ -4298,7 +5955,8 @@ async def post_init(app: Application) -> None:
 
 
 async def post_shutdown(app: Application) -> None:
-    for key in ("sweeper", "housekeeping"):
+    await flush_users()
+    for key in ("sweeper", "housekeeping", "logworker"):
         task = app.bot_data.get(key)
         if task:
             task.cancel()
@@ -4354,6 +6012,10 @@ def main() -> None:
     app.add_handler(CommandHandler("grant", cmd_grant))      # admin-checked; reply-to-grant works in groups
     app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("grants", cmd_grants, filters=private))
+    app.add_handler(CommandHandler("user", cmd_user, filters=private))
+    app.add_handler(CommandHandler("setlog", cmd_setlog, filters=private))
+    app.add_handler(CommandHandler("commands", cmd_commands))   # members of allowed groups + admins
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS & filters.ChatType.GROUPS, on_new_members))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast, filters=private))
     app.add_handler(CommandHandler("backup", cmd_backup, filters=private))
     app.add_handler(CommandHandler("audit", cmd_audit, filters=private))
